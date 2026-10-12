@@ -113,8 +113,9 @@ resource "azurerm_key_vault_secret" "wildcard" {
     "prefix"    = each.value.dns_zone_prefix
   })
 
-  # The Azure tag convention the agent uses (lowercase, underscores):
-  # AKSManager = ownership, managed_by = what created it. Terraform creates
+  # The Azure tag set the agent uses (AKSManager = Managed,
+  # deployed_by = GitOpsManager), with managed_by naming what created the
+  # resource -- here Terraform, not the agent. Terraform creates
   # these, so the agent treats them as read-only -- a manual save of the zone
   # certificate is refused rather than reverted by the next apply.
   tags = {
