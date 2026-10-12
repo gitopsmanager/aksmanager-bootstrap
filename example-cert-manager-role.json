@@ -1,0 +1,52 @@
+{
+  "_comment": [
+    "FOR THE CUSTOMER, not applied by this repo.",
+    "",
+    "A custom role definition for Let's Encrypt DNS-01 against Azure DNS. Assign",
+    "it to the certificate job's managed identity on each PUBLIC zone listed in",
+    "hosted-zones.json. DNS-01 is validated over the public internet, so the",
+    "challenge record has to be written where Let's Encrypt can resolve it.",
+    "",
+    "Create it once (Owner or User Access Administrator needed to define a role):",
+    "",
+    "  az role definition create --role-definition @example-cert-manager-role.json",
+    "",
+    "after replacing SUBSCRIPTION_ID in AssignableScopes with every subscription",
+    "that holds one of your public zones. Then, per zone:",
+    "",
+    "  az role assignment create --role 'AKS Manager ACME DNS-01' \\",
+    "    --assignee-object-id <cert job identity principal id> \\",
+    "    --assignee-principal-type ServicePrincipal \\",
+    "    --scope <public zone resource id>",
+    "",
+    "Assign at ZONE scope, never record-set scope: lego deletes the",
+    "_acme-challenge record after validating, which would delete a record-set",
+    "assignment with it.",
+    "",
+    "This is the tightest role in the system: TXT records in one zone, and",
+    "nothing else. It cannot create or change A or CNAME records, so it could not",
+    "be used to repoint a hostname. It is one step wider than the AWS equivalent,",
+    "which is also limited to names beginning _acme-challenge -- Azure RBAC has no",
+    "condition on DNS record names.",
+    "",
+    "If you prefer not to maintain a custom role, the built-in DNS Zone",
+    "Contributor works too, at the cost of allowing every record type in the zone.",
+    "",
+    "Delete this _comment key before creating the role; az rejects unknown keys."
+  ],
+  "Name": "AKS Manager ACME DNS-01",
+  "IsCustom": true,
+  "Description": "Write TXT records in a public DNS zone for Let's Encrypt DNS-01 validation. Nothing else.",
+  "Actions": [
+    "Microsoft.Network/dnsZones/read",
+    "Microsoft.Network/dnsZones/TXT/read",
+    "Microsoft.Network/dnsZones/TXT/write",
+    "Microsoft.Network/dnsZones/TXT/delete"
+  ],
+  "NotActions": [],
+  "DataActions": [],
+  "NotDataActions": [],
+  "AssignableScopes": [
+    "/subscriptions/SUBSCRIPTION_ID"
+  ]
+}
