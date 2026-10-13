@@ -234,6 +234,18 @@ if [ "$staging" = "false" ]; then
     done
 fi
 
+# The ACME account first, on its own. Staging and production accounts are
+# separate, so after acme-staging changes the account must be registered on the
+# new server -- but acme_certificate already asks that server about the account
+# while PLANNING, and fails with accountDoesNotExist before the registration in
+# the same apply could run. A targeted apply creates it first. On every other
+# run this changes nothing.
+log "terraform apply (ACME account)"
+terraform apply -input=false -auto-approve -target=acme_registration.this \
+    "-var=shared_services_subscription_id=${SUBSCRIPTION_ID}" \
+    "-var=key_vault_id=${KEY_VAULT_ID}" \
+    "-var=azure_auth_method=cli"
+
 log "terraform apply"
 terraform apply -input=false -auto-approve \
     "-var=shared_services_subscription_id=${SUBSCRIPTION_ID}" \
