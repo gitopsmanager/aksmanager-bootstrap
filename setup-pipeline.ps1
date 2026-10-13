@@ -49,8 +49,10 @@
       - terraform >= 1.5.0
       - python3 (validates hosted-zones.json)
       - hosted-zones.json in the repo root (copy example-hosted-zones.json)
-      - The DNS-01 role from example-cert-manager-role.json created in your
-        tenant (or set CERT_DNS_ROLE to "DNS Zone Contributor").
+      - Owner or User Access Administrator on every subscription holding a
+        zone in hosted-zones.json: this creates the TXT-only DNS-01 role
+        AKSManagerCertManager there if it is missing (or set CERT_DNS_ROLE to
+        use a role of your own, e.g. "DNS Zone Contributor").
 
 .EXAMPLE
     Paste the PowerShell block from Settings -> Terraform (Azure), then:
@@ -62,7 +64,7 @@
     .\setup-pipeline.ps1 -ContainerRegistrySku Premium
 
     Optional overrides:
-      $env:CERT_DNS_ROLE = "DNS Zone Contributor"     # default "AKS Manager ACME DNS-01"
+      $env:CERT_DNS_ROLE = "DNS Zone Contributor"     # default: AKSManagerCertManager, created if missing
       $env:AKSMANAGER_ALLOW_EMPTY_STATE = "true"      # see the empty-state guard
 #>
 
@@ -121,7 +123,10 @@ $AgentVnetId       = $env:AGENT_VNET_ID
 $AgentSubnetName   = $env:AGENT_SUBNET_NAME
 $CostTagName       = $env:RESOURCE_TAG_NAME
 $CostTagValue      = $env:RESOURCE_TAG_VALUE
-$CertDnsRole       = if ($env:CERT_DNS_ROLE) { $env:CERT_DNS_ROLE } else { "AKS Manager ACME DNS-01" }
+# Unset: our own custom role, created below if it does not exist. Set: a role
+# the customer chose (DNS Zone Contributor, or their own), used as is.
+$CertDnsRoleIsOurs = -not $env:CERT_DNS_ROLE
+$CertDnsRole       = if ($env:CERT_DNS_ROLE) { $env:CERT_DNS_ROLE } else { "AKSManagerCertManager" }
 
 foreach ($pair in @(
     @{ Name = "AZURE_TENANT_ID";                 Value = $TenantId }
@@ -447,19 +452,92 @@ $CertPrincipalId = $id.Data.principalId
 Grant-Role $CertPrincipalId "ServicePrincipal" "Key Vault Secrets Officer" $KeyVaultId $CertIdentity
 Grant-Role $CertPrincipalId "ServicePrincipal" "Storage Blob Data Contributor" $ContainerScope $CertIdentity
 
-# The DNS-01 role is the customer's (example-cert-manager-role.json). Checked
-# once up front so a missing definition is one clear message, not one per zone.
-$roleDef = Invoke-Az role definition list --name $CertDnsRole --scope "/subscriptions/$SubscriptionId"
-if (-not ($roleDef.Ok -and @($roleDef.Data).Count -gt 0)) {
+# The DNS-01 role. By default our own custom role, AKSManagerCertManager: TXT
+# records in a public zone and nothing else (the same definition as
+# example-cert-manager-role.json). Created when missing and assignable in every
+# subscription that holds a zone. An existing definition's permissions are
+# never changed -- a customer may have narrowed it -- only missing subscriptions
+# are added to where it can be assigned. Never deleted.
+#
+# With CERT_DNS_ROLE set, that role is used as is and nothing is created.
+$zoneSubs = @($zonesDoc.hosted_zones.PSObject.Properties.Value | ForEach-Object { [string]$_.subscription_id } |
+              Where-Object { $_ } | Sort-Object -Unique)
+$zoneScopes = @($zoneSubs | ForEach-Object { "/subscriptions/$_" })
+$firstScope = if ($zoneScopes.Count -gt 0) { $zoneScopes[0] } else { "/subscriptions/$SubscriptionId" }
+
+function Get-RoleDefinition([string] $Name, [string] $Scope) {
+    $r = Invoke-Az role definition list --name $Name --scope $Scope
+    if ($r.Ok -and @($r.Data).Count -gt 0) { return @($r.Data)[0] }
+    return $null
+}
+
+Write-Host ""
+Write-Host "DNS-01 role: $CertDnsRole"
+$roleDef = Get-RoleDefinition $CertDnsRole $firstScope
+if ($CertDnsRoleIsOurs) {
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) "aksmanager-certmanager-role-$([guid]::NewGuid().ToString('N')).json"
+    try {
+        if (-not $roleDef) {
+            ([ordered]@{
+                Name             = $CertDnsRole
+                IsCustom         = $true
+                Description      = "GitOps Manager: write TXT records in a public DNS zone for Let's Encrypt DNS-01 validation. Nothing else."
+                Actions          = @(
+                    "Microsoft.Network/dnsZones/read",
+                    "Microsoft.Network/dnsZones/TXT/read",
+                    "Microsoft.Network/dnsZones/TXT/write",
+                    "Microsoft.Network/dnsZones/TXT/delete")
+                NotActions       = @()
+                DataActions      = @()
+                NotDataActions   = @()
+                AssignableScopes = $zoneScopes
+            } | ConvertTo-Json -Depth 4) | Set-Content $tmp -Encoding utf8
+            Assert-Az "Creating role $CertDnsRole (needs Owner or User Access Administrator on $($zoneScopes -join ', '))" `
+                (Invoke-Az role definition create --role-definition "@$tmp") | Out-Null
+            Write-Host "  + created, assignable in $($zoneScopes -join ', ')"
+
+            # A new definition takes a while to be visible to role assignment.
+            for ($i = 1; $i -le 12 -and -not $roleDef; $i++) {
+                Start-Sleep -Seconds 10
+                $roleDef = Get-RoleDefinition $CertDnsRole $firstScope
+            }
+            if (-not $roleDef) { Write-Error "Role $CertDnsRole was created but is not visible yet. Run this script again in a few minutes."; exit 1 }
+        } else {
+            $have = @($roleDef.assignableScopes)
+            $add = @($zoneScopes | Where-Object { $have -notcontains $_ })
+            if ($add.Count -eq 0) {
+                Write-Host "  = exists"
+            } else {
+                $perm = @($roleDef.permissions)[0]
+                ([ordered]@{
+                    Id               = $roleDef.name          # the definition's GUID
+                    Name             = $roleDef.roleName
+                    IsCustom         = $true
+                    Description      = $roleDef.description
+                    Actions          = @($perm.actions)
+                    NotActions       = @($perm.notActions)
+                    DataActions      = @($perm.dataActions)
+                    NotDataActions   = @($perm.notDataActions)
+                    AssignableScopes = @($have + $add)
+                } | ConvertTo-Json -Depth 4) | Set-Content $tmp -Encoding utf8
+                Assert-Az "Adding $($add -join ', ') to where $CertDnsRole can be assigned" `
+                    (Invoke-Az role definition update --role-definition "@$tmp") | Out-Null
+                Write-Host "  ~ now assignable in $($add -join ', ') as well (permissions unchanged)"
+            }
+        }
+    } finally {
+        Remove-Item $tmp -ErrorAction SilentlyContinue
+    }
+} elseif (-not $roleDef) {
     Write-Error @"
-The role '$CertDnsRole' does not exist (or is not assignable in $SubscriptionId).
+The role '$CertDnsRole' (from CERT_DNS_ROLE) does not exist, or is not assignable in $firstScope.
 
-Create it from example-cert-manager-role.json (see the comment in that file), or
-use the built-in role instead, at the cost of allowing every record type:
-
-    `$env:CERT_DNS_ROLE = "DNS Zone Contributor"
+Unset CERT_DNS_ROLE to have this script create its own TXT-only role, AKSManagerCertManager,
+or create '$CertDnsRole' yourself first.
 "@
     exit 1
+} else {
+    Write-Host "  = exists (CERT_DNS_ROLE)"
 }
 foreach ($z in $zonesDoc.hosted_zones.PSObject.Properties.Value) {
     $zoneId = "/subscriptions/$($z.subscription_id)/resourceGroups/$($z.resource_group)/providers/Microsoft.Network/dnszones/$($z.public_dns_zone)"
