@@ -210,11 +210,36 @@ If this really is a fresh start, set ALLOW_EMPTY_STATE=true on the job for one r
     fi
 fi
 
+# Staging -> production. Terraform renews only inside min_days_remaining, so
+# after acme-staging is turned off a zone would keep its staging certificate --
+# untrusted root -- for about two months. -replace cannot force it either:
+# prevent_destroy refuses the destroy half. So when staging is off and any
+# zone's stored certificate came from a staging CA ("(STAGING) ..." issuer),
+# this run renews regardless of days remaining. Renewal is an in-place update,
+# which prevent_destroy allows. Every zone is renewed in that run, which costs
+# one certificate each against the 5-per-week limit for an identical name.
+renew_args=()
+staging=$(python3 -c 'import json; print(str(json.load(open("hosted-zones.auto.tfvars.json")).get("acme_use_staging", False)).lower())')
+if [ "$staging" = "false" ]; then
+    for key in "${keep[@]}"; do
+        prefix=$(python3 -c 'import json,sys; print(json.load(open("hosted-zones.auto.tfvars.json"))["hosted_zones"][sys.argv[1]]["dns_zone_prefix"])' "$key")
+        secret="${prefix//_/-}-dns-zone-certs"
+        issuer=$(az keyvault secret show --vault-name "$KEY_VAULT_NAME" --name "$secret" --query value -o tsv 2>/dev/null |
+                 python3 -c 'import json,sys; print(json.load(sys.stdin).get("tls.crt", ""))' 2>/dev/null |
+                 openssl x509 -noout -issuer 2>/dev/null || true)
+        if printf '%s' "$issuer" | grep -q -i 'staging'; then
+            log "$secret holds a staging certificate ($issuer) but acme-staging is off -- renewing now"
+            renew_args=("-var=min_days_remaining=365")
+        fi
+    done
+fi
+
 log "terraform apply"
 terraform apply -input=false -auto-approve \
     "-var=shared_services_subscription_id=${SUBSCRIPTION_ID}" \
     "-var=key_vault_id=${KEY_VAULT_ID}" \
-    "-var=azure_auth_method=cli"
+    "-var=azure_auth_method=cli" \
+    "${renew_args[@]}"
 
 log "Certificates:"
 terraform output -json certificate_expiry 2>/dev/null || true
