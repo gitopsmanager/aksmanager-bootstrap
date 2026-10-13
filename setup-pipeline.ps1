@@ -8,8 +8,8 @@
     aksmanager-bootstrap, signed in with `az login --tenant <tenant>` as an
     account that is Owner on the shared services subscription.
 
-    Phase 1 stands up what the certificate pipeline needs and issues the first
-    certificates. In order:
+    Phase 1 stands up the certificate pipeline: everything it needs, and the
+    Container Apps job that issues and renews the certificates. In order:
 
       1. Preflight: tools, tenant, subscription, your rights, hosted-zones.json.
       2. Resource providers registered (idempotent).
@@ -29,15 +29,26 @@
          saved certificate (not managed_by=Terraform), live or soft-deleted, is
          left out of this run and reported. Manual certificates are never
          overwritten.
-      9. pinned.auto.tfvars.json written to your private repo, using the
-         bootstrap GitHub App's credentials read from the Key Vault
-         (global-bootstrap-github-app). Settings -> Terraform -> Reload reads it.
-     10. terraform init + apply of terraform/lets-encrypt under your az login.
-         The plan is shown and needs your "yes".
+      9. The bootstrap GitHub App's credentials, read from the Key Vault
+         (global-bootstrap-github-app): the org and repo the workflow runs in.
+     10. A Log Analytics workspace and a Container Apps environment for the job.
+     11. The certificate job, job-aksmanager-letsencrypt: image
+         mcr.microsoft.com/azure-cli, running scripts/lets-encrypt-job.sh as
+         id-aksmanager-letsencrypt, weekly on its own cron. It is the Azure
+         counterpart of the AWS eksmanager-lets-encrypt CodeBuild project.
+     12. The workflow's identity, id-aksmanager-github: a federated credential
+         for this repo's main branch, allowed only to start that job and read
+         its logs (custom role AKSManagerJobStarter + Log Analytics Reader).
+     13. pinned.auto.tfvars.json written to your private repo. Settings ->
+         Terraform -> Reload reads it, and so does the workflow.
+
+    Certificates are not issued here. Run the "Run lets encrypt certificate
+    job" workflow (.github/workflows/lets-encrypt.yml) afterwards, or wait for
+    the weekly schedule. Issuance always runs inside Azure as the job's
+    identity, never under the operator's login or from the operator's network.
 
     It never creates DNS zones or delegation: those are yours, listed in
-    hosted-zones.json. The scheduled certificate job (Container Apps) and the
-    agent bootstrap are later phases.
+    hosted-zones.json. The agent bootstrap is a later phase.
 
     Idempotent -- safe to re-run.
 
@@ -46,7 +57,6 @@
       - PowerShell 7.1 or later (pwsh). RSA.ImportFromPem, used to sign the
         GitHub App JWT, needs .NET 5.
       - az CLI, signed in: az login --tenant <AZURE_TENANT_ID>
-      - terraform >= 1.5.0
       - python3 (validates hosted-zones.json)
       - hosted-zones.json in the repo root (copy example-hosted-zones.json)
       - Owner or User Access Administrator on every subscription holding a
@@ -163,6 +173,23 @@ $StateContainer = "tfstate"
 $StateKey       = "lets-encrypt.tfstate"
 $CertIdentity   = "id-aksmanager-letsencrypt"
 $AppSecretName  = "global-bootstrap-github-app"
+$GithubRepoName = "aksmanager-bootstrap"
+
+# The certificate job and what it runs in. Fixed names, like the AWS
+# eksmanager-lets-encrypt project, so every run and every operator lands on the
+# same resources.
+$LogWorkspace   = "log-aksmanager-bootstrap"
+$JobEnvironment = "cae-aksmanager-bootstrap"
+$JobName        = "job-aksmanager-letsencrypt"
+# az is needed inside the job: Terraform's azurerm backend cannot use a
+# Container Apps managed identity directly (hashicorp/terraform#37268), so the
+# job signs in with az login --identity and Terraform uses that login.
+$JobImage       = "mcr.microsoft.com/azure-cli:latest"
+# Weekly, Monday 03:17 UTC. Certificates renew inside 30 days of expiry, so a
+# failed week leaves three more attempts before anything lapses.
+$JobCron        = "17 3 * * 1"
+$GithubIdentity = "id-aksmanager-github"
+$JobStarterRole = "AKSManagerJobStarter"
 
 # What this script creates is tagged like everything else GitOps Manager makes.
 # managed_by names the bootstrap, not the agent: the agent treats these as
@@ -268,7 +295,10 @@ Write-Host "AKS Manager bootstrap -- phase 1 (Let's Encrypt)"
 Write-Host "================================================================"
 
 # ── 1. Preflight ─────────────────────────────────────────────────────────────
-foreach ($tool in @("az", "terraform")) {
+# az containerapp / monitor log-analytics are extensions on some az versions:
+# let az install them without prompting, for this run only.
+$env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL = "yes_without_prompt"
+foreach ($tool in @("az")) {
     if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
         Write-Error "$tool is required and is not on PATH."
         exit 1
@@ -310,7 +340,8 @@ $zonesDoc = Get-Content $TfvarsPath -Raw | ConvertFrom-Json
 # ── 2. Resource providers ────────────────────────────────────────────────────
 Write-Host ""
 Write-Host "Resource providers"
-foreach ($ns in @("Microsoft.KeyVault", "Microsoft.Storage", "Microsoft.ManagedIdentity", "Microsoft.Network") + $(if ($AcrName) { @("Microsoft.ContainerRegistry") } else { @() })) {
+foreach ($ns in @("Microsoft.KeyVault", "Microsoft.Storage", "Microsoft.ManagedIdentity", "Microsoft.Network",
+                  "Microsoft.App", "Microsoft.OperationalInsights") + $(if ($AcrName) { @("Microsoft.ContainerRegistry") } else { @() })) {
     $state = Invoke-Az provider show --namespace $ns --query registrationState
     if ($state.Ok -and $state.Data -eq "Registered") { Write-Host "  = $ns"; continue }
     Assert-Az "Registering $ns" (Invoke-Az provider register --namespace $ns --wait) | Out-Null
@@ -591,11 +622,12 @@ if ($blocked.Count -gt 0) {
     ($zonesDoc | ConvertTo-Json -Depth 5) | Set-Content $TfvarsPath -Encoding utf8
 }
 
-# ── 9. pinned.auto.tfvars.json in the private repo ───────────────────────────
-# The GitHub App's credentials live only in the Key Vault (written there by the
-# bootstrap App install). Read with your az login, used for one token, dropped.
+# ── 9. The bootstrap GitHub App ──────────────────────────────────────────────
+# The App's credentials live only in the Key Vault (written there by the
+# bootstrap App install). Read with your az login: the org and repo IDs name
+# the workflow's federated credential, and one token writes the pinned file.
 Write-Host ""
-Write-Host "GitHub: pinned.auto.tfvars.json"
+Write-Host "GitHub App: $AppSecretName"
 $app = Invoke-AzRetryAuth keyvault secret show --vault-name $KeyVaultName --name $AppSecretName --query value
 if (-not $app.Ok) {
     Write-Error "Could not read $AppSecretName from $KeyVaultName -- install the AKS Manager bootstrap GitHub App from Settings first.`n$($app.Err)"
@@ -604,11 +636,15 @@ if (-not $app.Ok) {
 $appCreds  = ([string]$app.Data) | ConvertFrom-Json
 $GithubOrg = $appCreds.githubOrg
 $GithubInstallId = $appCreds.installId
-$GithubRepoName = "aksmanager-bootstrap"
+# Immutable IDs: GitHub's OIDC sub claim names them for repos created after
+# 15 July 2026. Empty for an older install, which gets the legacy sub instead.
+$GithubOwnerId = [string]$appCreds.githubOwnerId
+$GithubRepoId  = [string]$appCreds.githubRepoId
 if (-not ($appCreds.appId -and $appCreds.privateKey -and $GithubInstallId -and $GithubOrg)) {
     Write-Error "$AppSecretName in $KeyVaultName is incomplete (needs appId, installId, privateKey, githubOrg). Reinstall the bootstrap GitHub App from Settings."
     exit 1
 }
+Write-Host "  = $GithubOrg/$GithubRepoName"
 
 function ConvertTo-Base64Url([byte[]] $Bytes) {
     [Convert]::ToBase64String($Bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
@@ -630,22 +666,210 @@ $installToken = (Invoke-RestMethod -Method Post `
 Remove-Variable appJwt -ErrorAction SilentlyContinue
 if (-not $installToken) { Write-Error "Could not get a GitHub App installation token."; exit 1 }
 
+# ── 10. Container Apps environment ───────────────────────────────────────────
+# The job's logs go to a workspace of its own, which the workflow reads back so
+# a run's output shows in the Actions log.
+Write-Host ""
+Write-Host "Container Apps environment: $JobEnvironment"
+$ws = Invoke-Az monitor log-analytics workspace show --resource-group $SharedRg --workspace-name $LogWorkspace
+if (-not $ws.Ok) {
+    if (-not (Test-NotFound $ws.Err)) { Write-Error "Could not read workspace $LogWorkspace`n$($ws.Err)"; exit 1 }
+    $ws = Invoke-Az monitor log-analytics workspace create --resource-group $SharedRg --workspace-name $LogWorkspace `
+        --location $Location --retention-time 30 --tags @TagArgs
+    Assert-Az "Creating Log Analytics workspace $LogWorkspace" $ws | Out-Null
+    Write-Host "  + workspace $LogWorkspace created (30-day retention)"
+} else {
+    Write-Host "  = workspace $LogWorkspace exists"
+}
+$WorkspaceId         = $ws.Data.id
+$WorkspaceCustomerId = $ws.Data.customerId
+
+$cae = Invoke-Az containerapp env show --resource-group $SharedRg --name $JobEnvironment
+if (-not $cae.Ok) {
+    if (-not (Test-NotFound $cae.Err)) { Write-Error "Could not read $JobEnvironment`n$($cae.Err)"; exit 1 }
+    $wsKeys = Assert-Az "Reading the key of $LogWorkspace" `
+        (Invoke-Az monitor log-analytics workspace get-shared-keys --resource-group $SharedRg --workspace-name $LogWorkspace)
+    Write-Host "  creating $JobEnvironment (a few minutes)..."
+    Assert-Az "Creating Container Apps environment $JobEnvironment" `
+        (Invoke-Az containerapp env create --resource-group $SharedRg --name $JobEnvironment --location $Location `
+            --logs-destination log-analytics --logs-workspace-id $WorkspaceCustomerId `
+            --logs-workspace-key $wsKeys.primarySharedKey --tags @TagArgs) | Out-Null
+    Remove-Variable wsKeys -ErrorAction SilentlyContinue
+    $cae = Invoke-Az containerapp env show --resource-group $SharedRg --name $JobEnvironment
+    Assert-Az "Reading $JobEnvironment" $cae | Out-Null
+    Write-Host "  + environment created"
+} else {
+    Write-Host "  = environment exists"
+}
+$EnvironmentId = $cae.Data.id
+
+# ── 11. The certificate job ──────────────────────────────────────────────────
+# Created or updated from one spec on every run, so the job always matches
+# this script -- including the job script itself, which is carried in the
+# job's environment rather than fetched at run time.
+Write-Host ""
+Write-Host "Certificate job: $JobName"
+$jobScriptPath = Join-Path $RepoRoot "scripts/lets-encrypt-job.sh"
+if (-not (Test-Path $jobScriptPath)) { Write-Error "scripts/lets-encrypt-job.sh not found in $RepoRoot -- Sync the repo from Settings."; exit 1 }
+# LF only: a Windows checkout may have CRLF, which breaks bash in the job.
+$jobScript = (Get-Content $jobScriptPath -Raw) -replace "`r`n", "`n"
+$jobEnv = [ordered]@{
+    AZURE_CLIENT_ID      = $id.Data.clientId
+    TENANT_ID            = $TenantId
+    SUBSCRIPTION_ID      = $SubscriptionId
+    KEY_VAULT_NAME       = $KeyVaultName
+    KEY_VAULT_ID         = $KeyVaultId
+    APP_SECRET_NAME      = $AppSecretName
+    GITHUB_REPO_NAME     = $GithubRepoName
+    STATE_RESOURCE_GROUP = $SharedRg
+    STATE_ACCOUNT        = $StateAccount
+    STATE_CONTAINER      = $StateContainer
+    STATE_KEY            = $StateKey
+    # Empty: the current Terraform release. Set TERRAFORM_VERSION before running
+    # setup to pin one.
+    TERRAFORM_VERSION    = [string]$env:TERRAFORM_VERSION
+    JOB_SCRIPT_B64       = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($jobScript))
+}
+$jobSpec = [ordered]@{
+    location   = $Location
+    tags       = $Tags
+    identity   = @{ type = "UserAssigned"; userAssignedIdentities = @{ ($id.Data.id) = @{} } }
+    properties = [ordered]@{
+        environmentId = $EnvironmentId
+        configuration = [ordered]@{
+            triggerType           = "Schedule"
+            replicaTimeout        = 3600
+            replicaRetryLimit     = 0
+            scheduleTriggerConfig = [ordered]@{ cronExpression = $JobCron; parallelism = 1; replicaCompletionCount = 1 }
+        }
+        template = @{
+            containers = @(
+                [ordered]@{
+                    name      = "lets-encrypt"
+                    image     = $JobImage
+                    command   = @("/bin/bash", "-c")
+                    args      = @('echo "$JOB_SCRIPT_B64" | base64 -d > /tmp/lets-encrypt-job.sh && exec bash /tmp/lets-encrypt-job.sh')
+                    env       = @($jobEnv.GetEnumerator() | ForEach-Object { [ordered]@{ name = $_.Key; value = [string]$_.Value } })
+                    resources = [ordered]@{ cpu = 0.5; memory = "1Gi" }
+                }
+            )
+        }
+    }
+}
+# JSON is valid YAML, which is what --yaml reads.
+$jobSpecFile = Join-Path ([IO.Path]::GetTempPath()) "aksmanager-job-$([guid]::NewGuid().ToString('N')).yaml"
+try {
+    ($jobSpec | ConvertTo-Json -Depth 12) | Set-Content $jobSpecFile -Encoding utf8
+    $job = Invoke-Az containerapp job show --resource-group $SharedRg --name $JobName
+    if ($job.Ok) {
+        Assert-Az "Updating job $JobName" `
+            (Invoke-Az containerapp job update --resource-group $SharedRg --name $JobName --yaml $jobSpecFile) | Out-Null
+        Write-Host "  ~ updated (image $JobImage, schedule '$JobCron' UTC)"
+    } elseif (Test-NotFound $job.Err) {
+        Assert-Az "Creating job $JobName" `
+            (Invoke-Az containerapp job create --resource-group $SharedRg --name $JobName --yaml $jobSpecFile) | Out-Null
+        Write-Host "  + created (image $JobImage, schedule '$JobCron' UTC)"
+    } else {
+        Write-Error "Could not read job $JobName`n$($job.Err)"; exit 1
+    }
+} finally {
+    Remove-Item $jobSpecFile -ErrorAction SilentlyContinue
+}
+$job = Invoke-Az containerapp job show --resource-group $SharedRg --name $JobName
+Assert-Az "Reading job $JobName" $job | Out-Null
+$JobId = $job.Data.id
+
+# ── 12. The workflow's identity ──────────────────────────────────────────────
+# What GitHub gets: a federated credential for this repo's main branch, on an
+# identity that can start and stop this one job and read its logs. Nothing
+# else -- not the certificates, the DNS zones or the state. Those stay with the
+# job's own identity, inside Azure.
+Write-Host ""
+Write-Host "Workflow identity: $GithubIdentity"
+$gi = Invoke-Az identity show --name $GithubIdentity --resource-group $SharedRg
+if (-not $gi.Ok) {
+    if (-not (Test-NotFound $gi.Err)) { Write-Error "Could not read identity $GithubIdentity`n$($gi.Err)"; exit 1 }
+    $gi = Invoke-Az identity create --name $GithubIdentity --resource-group $SharedRg --location $Location --tags @TagArgs
+    Assert-Az "Creating identity $GithubIdentity" $gi | Out-Null
+    Write-Host "  + created"
+} else {
+    Write-Host "  = exists"
+}
+
+$subRepo = if ($GithubOwnerId -and $GithubRepoId) { "$GithubOrg@$GithubOwnerId/$GithubRepoName@$GithubRepoId" } else { "$GithubOrg/$GithubRepoName" }
+$GithubSubject = "repo:${subRepo}:ref:refs/heads/main"
+$ficName = "github-lets-encrypt"
+$fic = Invoke-Az identity federated-credential show --identity-name $GithubIdentity --resource-group $SharedRg --name $ficName
+if ($fic.Ok -and $fic.Data.subject -eq $GithubSubject) {
+    Write-Host "  = federated credential for $GithubSubject"
+} else {
+    if (-not $fic.Ok -and -not (Test-NotFound $fic.Err)) { Write-Error "Could not read federated credential $ficName`n$($fic.Err)"; exit 1 }
+    $verb = if ($fic.Ok) { "update" } else { "create" }
+    Assert-Az "Setting federated credential $ficName" `
+        (Invoke-Az identity federated-credential $verb --identity-name $GithubIdentity --resource-group $SharedRg --name $ficName `
+            --issuer "https://token.actions.githubusercontent.com" --subject $GithubSubject --audiences "api://AzureADTokenExchange") | Out-Null
+    Write-Host "  + federated credential for $GithubSubject"
+}
+
+# Start and stop this job and read its executions -- not change it. Changing
+# the job would mean choosing what runs as the certificate identity.
+$starterDef = Get-RoleDefinition $JobStarterRole "/subscriptions/$SubscriptionId"
+if (-not $starterDef) {
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) "aksmanager-jobstarter-role-$([guid]::NewGuid().ToString('N')).json"
+    try {
+        ([ordered]@{
+            Name             = $JobStarterRole
+            IsCustom         = $true
+            Description      = "GitOps Manager: start and stop a Container Apps job and read its executions. Cannot change the job."
+            Actions          = @(
+                "Microsoft.App/jobs/read",
+                "Microsoft.App/jobs/*/read",
+                "Microsoft.App/jobs/start/action",
+                "Microsoft.App/jobs/stop/action")
+            NotActions       = @()
+            DataActions      = @()
+            NotDataActions   = @()
+            AssignableScopes = @("/subscriptions/$SubscriptionId")
+        } | ConvertTo-Json -Depth 4) | Set-Content $tmp -Encoding utf8
+        Assert-Az "Creating role $JobStarterRole" (Invoke-Az role definition create --role-definition "@$tmp") | Out-Null
+        Write-Host "  + role $JobStarterRole created"
+        for ($i = 1; $i -le 12 -and -not $starterDef; $i++) {
+            Start-Sleep -Seconds 10
+            $starterDef = Get-RoleDefinition $JobStarterRole "/subscriptions/$SubscriptionId"
+        }
+        if (-not $starterDef) { Write-Error "Role $JobStarterRole was created but is not visible yet. Run this script again in a few minutes."; exit 1 }
+    } finally {
+        Remove-Item $tmp -ErrorAction SilentlyContinue
+    }
+}
+Grant-Role $gi.Data.principalId "ServicePrincipal" $JobStarterRole $JobId "$GithubIdentity on $JobName"
+Grant-Role $gi.Data.principalId "ServicePrincipal" "Log Analytics Reader" $WorkspaceId "$GithubIdentity on $LogWorkspace"
+
+# ── 13. pinned.auto.tfvars.json in the private repo ──────────────────────────
+# Settings -> Terraform -> Reload reads it, and the workflow takes the job,
+# the identity and the workspace from it -- no repository variables to set.
+Write-Host ""
+Write-Host "GitHub: pinned.auto.tfvars.json"
 $pinned = [ordered]@{
-    tenant_id                         = $TenantId
-    shared_services_subscription_id   = $SubscriptionId
-    location                          = $Location
-    shared_services_resource_group    = $SharedRg
-    key_vault_name                    = $KeyVaultName
-    key_vault_resource_group          = $KeyVaultRg
-    container_registry_name           = $AcrName
-    container_registry_resource_group = $(if ($AcrName) { $AcrRg } else { "" })
-    agent_vm_name                     = $AgentVmName
-    agent_vnet_id                     = $AgentVnetId
-    agent_subnet_name                 = $AgentSubnetName
-    resource_tag_name                 = $CostTagName
-    resource_tag_value                = $CostTagValue
-    state_storage_account             = $StateAccount
-    cert_identity_client_id           = $id.Data.clientId
+    tenant_id                           = $TenantId
+    shared_services_subscription_id     = $SubscriptionId
+    location                            = $Location
+    shared_services_resource_group      = $SharedRg
+    key_vault_name                      = $KeyVaultName
+    key_vault_resource_group            = $KeyVaultRg
+    container_registry_name             = $AcrName
+    container_registry_resource_group   = $(if ($AcrName) { $AcrRg } else { "" })
+    agent_vm_name                       = $AgentVmName
+    agent_vnet_id                       = $AgentVnetId
+    agent_subnet_name                   = $AgentSubnetName
+    resource_tag_name                   = $CostTagName
+    resource_tag_value                  = $CostTagValue
+    state_storage_account               = $StateAccount
+    cert_identity_client_id             = $id.Data.clientId
+    lets_encrypt_job_name               = $JobName
+    container_apps_environment          = $JobEnvironment
+    log_analytics_workspace_customer_id = $WorkspaceCustomerId
+    github_identity_client_id           = $gi.Data.clientId
 }
 $pinnedJson = $pinned | ConvertTo-Json
 $headers = @{ Authorization = "Bearer $installToken"; Accept = "application/vnd.github+json" }
@@ -667,67 +891,27 @@ try {
 }
 Remove-Variable installToken -ErrorAction SilentlyContinue
 
-# ── 10. terraform/lets-encrypt ───────────────────────────────────────────────
-Write-Host ""
-Write-Host "terraform/lets-encrypt"
-Push-Location "terraform/lets-encrypt"
-try {
-    terraform init -input=false -reconfigure `
-        "-backend-config=storage_account_name=$StateAccount" `
-        "-backend-config=container_name=$StateContainer" `
-        "-backend-config=key=$StateKey" `
-        "-backend-config=resource_group_name=$SharedRg" `
-        "-backend-config=subscription_id=$SubscriptionId" `
-        "-backend-config=tenant_id=$TenantId"
-    if ($LASTEXITCODE -ne 0) { Write-Error "terraform init failed."; exit 1 }
-
-    # Empty-state guard, as on AWS. If the state account predates this run and
-    # the state is empty while pipeline-written certificates exist, the state
-    # was lost: applying would try to recreate every secret.
-    $prevEap = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    $stateList = @(terraform state list 2>$null)
-    $ErrorActionPreference = $prevEap
-    $managed = @($stateList | Where-Object { $_ -and $_ -notmatch '^data\.' }).Count
-    if ($StatePreexisted -and $managed -eq 0 -and $env:AKSMANAGER_ALLOW_EMPTY_STATE -ne "true") {
-        $ours = Invoke-AzRetryAuth keyvault secret list --vault-name $KeyVaultName --query "[?tags.managed_by=='Terraform'].name"
-        if ($ours.Ok -and @($ours.Data).Count -gt 0) {
-            Write-Error @"
-The Terraform state for lets-encrypt is empty, but $KeyVaultName already holds
-certificates the pipeline wrote ($(@($ours.Data) -join ', ')). The state has been
-lost, not never created; applying would try to recreate them.
-
-Check the blob's versions before anything else:
-
-    az storage blob list --account-name $StateAccount --container-name $StateContainer --auth-mode login --include v -o table
-
-If this really is a fresh start, re-run with `$env:AKSMANAGER_ALLOW_EMPTY_STATE = "true".
-"@
-            exit 1
-        }
-    }
-
-    terraform apply `
-        "-var=shared_services_subscription_id=$SubscriptionId" `
-        "-var=key_vault_id=$KeyVaultId" `
-        "-var=azure_auth_method=cli"
-    if ($LASTEXITCODE -ne 0) { Write-Error "terraform apply did not complete."; exit 1 }
-} finally {
-    Pop-Location
-}
-
 Write-Host ""
 Write-Host "================================================================"
-Write-Host "Phase 1 done."
+Write-Host "Phase 1 done. Certificates are issued by the job, not by this script."
+Write-Host "  Job:        $JobName in $SharedRg -- weekly, '$JobCron' UTC"
+Write-Host "  Runs as:    $CertIdentity ($($id.Data.clientId))"
+Write-Host "  Workflow:   $GithubIdentity, trusted for $GithubSubject"
+Write-Host "  Logs:       $LogWorkspace"
 Write-Host "  State:      $StateAccount/$StateContainer/$StateKey"
 Write-Host "  Key Vault:  $KeyVaultName"
-Write-Host "  Identity:   $CertIdentity ($($id.Data.clientId))"
 if ($blocked.Count -gt 0) {
     Write-Host ""
-    Write-Host "Skipped by the vault guard:"
+    Write-Host "The vault guard will skip (the job checks again on every run):"
     foreach ($b in $blocked) { Write-Host "  - $b" }
 }
 Write-Host ""
-Write-Host "Check a certificate:"
+Write-Host "Issue the certificates now -- in ${GithubOrg}/${GithubRepoName}:"
+Write-Host "  Actions -> 'Run lets encrypt certificate job' -> Run workflow"
+Write-Host "  (.github/workflows/lets-encrypt.yml; Sync from Settings brings it into the repo)"
+Write-Host "or start the job directly:"
+Write-Host "  az containerapp job start --name $JobName --resource-group $SharedRg"
+Write-Host ""
+Write-Host "Check a certificate afterwards:"
 Write-Host "  az keyvault secret show --vault-name $KeyVaultName -n <prefix>-dns-zone-certs --query `"{expires:attributes.expires, tags:tags}`""
 Write-Host "================================================================"

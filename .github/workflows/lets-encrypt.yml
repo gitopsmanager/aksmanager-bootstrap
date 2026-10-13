@@ -1,0 +1,126 @@
+# Copyright (c) 2026 GitOps Manager, S.L. All rights reserved.
+name: Run lets encrypt certificate job
+
+# Manually dispatched. Starts the Container Apps job job-aksmanager-letsencrypt,
+# which issues and renews one wildcard certificate per zone in
+# hosted-zones.json and stores each in Key Vault as <prefix>-dns-zone-certs.
+# The Azure counterpart of the AWS "Publish lets encrypt certificate pipeline".
+#
+# Run this after editing hosted-zones.json -- adding a zone, moving between
+# staging and production -- or after syncing new code from the public repo.
+# You do NOT need to run it for renewals: the job runs weekly on its own
+# schedule, and Terraform reissues only certificates inside min_days_remaining.
+#
+# The certificates are issued inside Azure by the job, as its own managed
+# identity. This workflow never sees them: its identity, id-aksmanager-github,
+# can only start and stop the job and read its logs.
+#
+# Needs no repository variables. setup-pipeline.ps1 writes everything this
+# reads into pinned.auto.tfvars.json, and creates the federated credential
+# that lets this repo's main branch sign in.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  run-certificate-job:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Fail here rather than in the job. The job validates again with the same
+      # script, but a malformed zone list is quicker to see here, and a zone
+      # silently missing makes Terraform destroy that certificate and its
+      # secret.
+      - name: Validate hosted-zones.json
+        run: python3 scripts/hosted_zones_tfvars.py hosted-zones.json "$RUNNER_TEMP/hosted-zones.auto.tfvars.json"
+
+      - name: Read setup's outputs
+        id: setup
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          try:
+              p = json.load(open("pinned.auto.tfvars.json"))
+          except FileNotFoundError:
+              sys.exit("pinned.auto.tfvars.json not found -- run setup-pipeline.ps1 first; it writes this file.")
+          need = {
+              "client_id":       "github_identity_client_id",
+              "tenant_id":       "tenant_id",
+              "subscription_id": "shared_services_subscription_id",
+              "resource_group":  "shared_services_resource_group",
+              "job_name":        "lets_encrypt_job_name",
+              "workspace_id":    "log_analytics_workspace_customer_id",
+          }
+          missing = [k for k in need.values() if not p.get(k)]
+          if missing:
+              sys.exit("pinned.auto.tfvars.json has no " + ", ".join(missing) +
+                       " -- re-run setup-pipeline.ps1 (an older run did not create the job).")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              for name, key in need.items():
+                  out.write(f"{name}={p[key]}\n")
+          print(f"job {p['lets_encrypt_job_name']} in {p['shared_services_resource_group']}")
+          PY
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ steps.setup.outputs.client_id }}
+          tenant-id: ${{ steps.setup.outputs.tenant_id }}
+          subscription-id: ${{ steps.setup.outputs.subscription_id }}
+
+      - name: Start the job and wait for it
+        id: run
+        env:
+          JOB: ${{ steps.setup.outputs.job_name }}
+          RG: ${{ steps.setup.outputs.resource_group }}
+          AZURE_EXTENSION_USE_DYNAMIC_INSTALL: yes_without_prompt
+        run: |
+          set -euo pipefail
+          execution=$(az containerapp job start --name "$JOB" --resource-group "$RG" --query name -o tsv)
+          echo "execution=$execution" >> "$GITHUB_OUTPUT"
+          echo "Started $execution"
+
+          # The job's own timeout is an hour; wait a little longer than that.
+          status=Running
+          for _ in $(seq 1 130); do
+            status=$(az containerapp job execution show --name "$JOB" --resource-group "$RG" \
+                       --job-execution-name "$execution" --query properties.status -o tsv)
+            echo "$(date -u +%H:%M:%S) $status"
+            case "$status" in Succeeded|Failed|Stopped|Degraded) break ;; esac
+            sleep 30
+          done
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      # Logs reach the workspace a few minutes after the job writes them, so
+      # this waits for them rather than reading too early.
+      - name: Job output
+        if: always() && steps.run.outputs.execution != ''
+        env:
+          WORKSPACE: ${{ steps.setup.outputs.workspace_id }}
+          EXECUTION: ${{ steps.run.outputs.execution }}
+          AZURE_EXTENSION_USE_DYNAMIC_INSTALL: yes_without_prompt
+        run: |
+          query="ContainerAppConsoleLogs_CL | where ContainerGroupName_s startswith '${EXECUTION}' | order by TimeGenerated asc | project Log_s"
+          for _ in $(seq 1 12); do
+            lines=$(az monitor log-analytics query --workspace "$WORKSPACE" --analytics-query "$query" \
+                      --query "[].Log_s" -o tsv 2>/dev/null || true)
+            if [ -n "$lines" ] && printf '%s\n' "$lines" | grep -q -E 'Done|ERROR:'; then break; fi
+            sleep 30
+          done
+          if [ -n "${lines:-}" ]; then
+            printf '%s\n' "$lines"
+          else
+            echo "No log lines yet -- they can take several minutes to arrive."
+            echo "Query the workspace with: $query"
+          fi
+
+      - name: Result
+        if: always() && steps.run.outputs.execution != ''
+        run: |
+          status="${{ steps.run.outputs.status }}"
+          echo "Execution ${{ steps.run.outputs.execution }}: $status"
+          [ "$status" = "Succeeded" ] || { echo "The certificate job did not succeed."; exit 1; }
