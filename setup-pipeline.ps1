@@ -75,8 +75,35 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Started from Windows PowerShell 5.1 -- the default "powershell" on Windows,
+# which installing 7 does not replace. If pwsh is installed, run this script
+# again under it: the environment variables pasted from Settings are inherited
+# by the child process, so nothing needs re-entering. If not, say how to get it.
+# Plain 5.1 syntax only in this block -- it has to parse there.
 if ($PSVersionTable.PSVersion -lt [Version]"7.1") {
-    Write-Error "PowerShell 7.1 or later is required (pwsh). This is $($PSVersionTable.PSVersion)."
+    $pwsh = $null
+    $cmd = Get-Command pwsh -ErrorAction SilentlyContinue
+    if ($cmd) { $pwsh = $cmd.Source }
+    # A window opened before the install has the old PATH; look where the
+    # installer puts it.
+    if (-not $pwsh) {
+        $candidate = Join-Path $env:ProgramFiles "PowerShell\7\pwsh.exe"
+        if (Test-Path $candidate) { $pwsh = $candidate }
+    }
+
+    if ($pwsh) {
+        Write-Host "This is Windows PowerShell $($PSVersionTable.PSVersion); re-running under PowerShell 7 ($pwsh)..."
+        & $pwsh -NoProfile -File $PSCommandPath -ContainerRegistrySku $ContainerRegistrySku
+        exit $LASTEXITCODE
+    }
+
+    Write-Host ""
+    Write-Host "PowerShell 7.1 or later is required (pwsh). This is Windows PowerShell $($PSVersionTable.PSVersion)." -ForegroundColor Red
+    Write-Host "Install it alongside 5.1 (it does not replace it), then run this script again:"
+    Write-Host ""
+    Write-Host "    winget install --id Microsoft.PowerShell --source winget"
+    Write-Host ""
+    Write-Host "No winget? https://aka.ms/powershell-release?tag=stable"
     exit 1
 }
 
