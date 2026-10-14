@@ -57,7 +57,6 @@
       - PowerShell 7.1 or later (pwsh). RSA.ImportFromPem, used to sign the
         GitHub App JWT, needs .NET 5.
       - az CLI, signed in: az login --tenant <AZURE_TENANT_ID>
-      - python3 (validates hosted-zones.json)
       - hosted-zones.json in the repo root (copy example-hosted-zones.json)
       - Owner or User Access Administrator on every subscription holding a
         zone in hosted-zones.json: this creates the TXT-only DNS-01 role
@@ -92,30 +91,71 @@ $ErrorActionPreference = "Stop"
 # again under it: the environment variables pasted from Settings are inherited
 # by the child process, so nothing needs re-entering. If not, say how to get it.
 # Plain 5.1 syntax only in this block -- it has to parse there.
+#
+# Missing, or older than 7.1: offer to install or upgrade it with winget (asked
+# first, never silent). Already running an old pwsh 7.0 itself: say how to
+# upgrade -- the running pwsh cannot replace itself, and re-running it would
+# only loop.
 if ($PSVersionTable.PSVersion -lt [Version]"7.1") {
-    $pwsh = $null
-    $cmd = Get-Command pwsh -ErrorAction SilentlyContinue
-    if ($cmd) { $pwsh = $cmd.Source }
-    # A window opened before the install has the old PATH; look where the
-    # installer puts it.
-    if (-not $pwsh) {
+    function Find-Pwsh {
+        $cmd = Get-Command pwsh -ErrorAction SilentlyContinue
+        if ($cmd) { return $cmd.Source }
+        # A window opened before the install has the old PATH; look where the
+        # installer puts it.
         $candidate = Join-Path $env:ProgramFiles "PowerShell\7\pwsh.exe"
-        if (Test-Path $candidate) { $pwsh = $candidate }
+        if (Test-Path $candidate) { return $candidate }
+        return $null
+    }
+    function Get-PwshVersion([string] $Path) {
+        try { return [Version](& $Path -NoProfile -Command '$PSVersionTable.PSVersion.ToString()' 2>$null | Select-Object -First 1) } catch { return $null }
+    }
+    function Confirm-Winget([string] $What) {
+        if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { return $false }
+        $answer = Read-Host "$What with winget now? [y/N]"
+        return ($answer -match '^(y|yes)$')
+    }
+    $wingetArgs = @("--id", "Microsoft.PowerShell", "--exact", "--source", "winget",
+                    "--accept-source-agreements", "--accept-package-agreements")
+
+    if ($PSVersionTable.PSEdition -eq "Core") {
+        Write-Host "This is PowerShell $($PSVersionTable.PSVersion); 7.1 or later is required. Upgrade it, then run this script again:" -ForegroundColor Red
+        Write-Host ""
+        Write-Host "    winget upgrade --id Microsoft.PowerShell --source winget"
+        exit 1
+    }
+
+    $pwsh = Find-Pwsh
+    if ($pwsh) {
+        $ver = Get-PwshVersion $pwsh
+        if ($ver -and $ver -lt [Version]"7.1") {
+            Write-Host "PowerShell $ver is installed ($pwsh); this script needs 7.1 or later."
+            if (Confirm-Winget "Upgrade PowerShell") {
+                & winget upgrade @wingetArgs
+                $pwsh = Find-Pwsh
+            } else {
+                $pwsh = $null
+            }
+        }
+    } else {
+        Write-Host "This is Windows PowerShell $($PSVersionTable.PSVersion); this script needs PowerShell 7.1 or later (pwsh), which installs alongside it."
+        if (Confirm-Winget "Install PowerShell 7") {
+            & winget install @wingetArgs
+            $pwsh = Find-Pwsh
+        }
     }
 
     if ($pwsh) {
-        Write-Host "This is Windows PowerShell $($PSVersionTable.PSVersion); re-running under PowerShell 7 ($pwsh)..."
+        Write-Host "Re-running under PowerShell 7 ($pwsh)..."
         & $pwsh -NoProfile -File $PSCommandPath -ContainerRegistrySku $ContainerRegistrySku
         exit $LASTEXITCODE
     }
 
     Write-Host ""
-    Write-Host "PowerShell 7.1 or later is required (pwsh). This is Windows PowerShell $($PSVersionTable.PSVersion)." -ForegroundColor Red
-    Write-Host "Install it alongside 5.1 (it does not replace it), then run this script again:"
+    Write-Host "PowerShell 7.1 or later is required (pwsh). Install it alongside Windows PowerShell, then run this script again:" -ForegroundColor Red
     Write-Host ""
     Write-Host "    winget install --id Microsoft.PowerShell --source winget"
     Write-Host ""
-    Write-Host "No winget? https://aka.ms/powershell-release?tag=stable"
+    Write-Host "No winget? https://aka.ms/powershell-release?tag=stable -- or run this from Azure Cloud Shell, which has it."
     exit 1
 }
 
@@ -298,14 +338,22 @@ Write-Host "================================================================"
 # az containerapp / monitor log-analytics are extensions on some az versions:
 # let az install them without prompting, for this run only.
 $env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL = "yes_without_prompt"
-foreach ($tool in @("az")) {
-    if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
-        Write-Error "$tool is required and is not on PATH."
+# The Azure CLI is the one tool this needs. On Windows, offer winget if it is
+# missing (asked first). Its installer's PATH change does not reach this
+# window, so the usual install folder is added for this run.
+if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
+    $azDir = Join-Path $env:ProgramFiles "Microsoft SDKs\Azure\CLI2\wbin"
+    if (-not (Test-Path (Join-Path $azDir "az.cmd")) -and (Get-Command winget -ErrorAction SilentlyContinue)) {
+        if ((Read-Host "The Azure CLI (az) is required and not installed. Install it with winget now? [y/N]") -match '^(y|yes)$') {
+            & winget install --id Microsoft.AzureCLI --exact --source winget --accept-source-agreements --accept-package-agreements
+        }
+    }
+    if (Test-Path (Join-Path $azDir "az.cmd")) { $env:PATH = "$azDir;$env:PATH" }
+    if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
+        Write-Error "The Azure CLI (az) is required and is not on PATH: winget install --id Microsoft.AzureCLI (or run this from Azure Cloud Shell)."
         exit 1
     }
 }
-$Python = @("python3", "python") | Where-Object { Get-Command $_ -ErrorAction SilentlyContinue } | Select-Object -First 1
-if (-not $Python) { Write-Error "python3 is required (it validates hosted-zones.json)."; exit 1 }
 if (-not (Test-Path "hosted-zones.json")) {
     Write-Error "hosted-zones.json not found in $RepoRoot. Copy example-hosted-zones.json, fill it in and commit it."
     exit 1
@@ -331,11 +379,73 @@ if ($myRoles.Ok -and -not (@($myRoles.Data) | Where-Object { $_ -in @("Owner", "
     Write-Warning "No direct Owner / User Access Administrator on the subscription found for you. If it comes through a group, ignore this; otherwise the role grants below will fail."
 }
 
-# The zone file, validated by the same script the scheduled job will use.
-& $Python scripts/hosted_zones_tfvars.py
-if ($LASTEXITCODE -ne 0) { Write-Error "hosted-zones.json did not validate (see above)."; exit 1 }
-$TfvarsPath = "terraform/lets-encrypt/hosted-zones.auto.tfvars.json"
-$zonesDoc = Get-Content $TfvarsPath -Raw | ConvertFrom-Json
+# The zone file. Read here with the same rules as scripts/hosted_zones_tfvars.py,
+# which the workflow and the job run before anything is issued -- so setup
+# needs no Python, and a file that passes one passes the other. Keyed by zone
+# name, as the job's Terraform keys its certificates.
+function Read-HostedZones([string] $Path) {
+    try { $doc = Get-Content $Path -Raw | ConvertFrom-Json } catch {
+        Write-Error "$Path is not valid JSON: $($_.Exception.Message)"
+        exit 1
+    }
+    $problems = @()
+    $email = [string]$doc.'acme-email'
+    if (-not $email) { $problems += "missing top-level 'acme-email' -- Let's Encrypt requires a registration contact, and it is where expiry warnings go" }
+    elseif ($email -notmatch '@') { $problems += "acme-email '$email' does not look like an address" }
+    $staging = $doc.'acme-staging'
+    if ($null -eq $staging) { $staging = $false }
+    elseif ($staging -isnot [bool]) { $problems += "acme-staging must be true or false, not '$staging'" }
+
+    $zones = @($doc.'hosted-zones' | Where-Object { $_ })
+    if ($zones.Count -eq 0) { $problems += "no 'hosted-zones' entries" }
+    $resolved = [ordered]@{}
+    $seenSecret = @{}
+    for ($i = 0; $i -lt $zones.Count; $i++) {
+        $z = $zones[$i]
+        $name = [string]$z.'public-dns-zone'
+        $where = if ($name) { $name } else { "entry $i" }
+        foreach ($field in @("dns-zone-prefix", "public-dns-zone", "subscription", "resource-group")) {
+            if (-not $z.$field) { $problems += "${where}: missing '$field'" }
+        }
+        $prefix = [string]$z.'dns-zone-prefix'
+        if ($prefix) {
+            if ($prefix -cnotmatch '^[A-Za-z0-9_-]+$') { $problems += "${where}: dns-zone-prefix '$prefix' may contain only letters, digits, '-' and '_'" }
+            # Two prefixes that differ only by '_' vs '-' would name one secret.
+            $secret = ($prefix -replace '_', '-') + "-dns-zone-certs"
+            if ($seenSecret.ContainsKey($secret)) { $problems += "${where}: dns-zone-prefix '$prefix' and '$($seenSecret[$secret])' both name the secret '$secret'" }
+            $seenSecret[$secret] = $prefix
+        }
+        $sub = [string]$z.subscription
+        if ($sub -and $sub -notmatch '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') { $problems += "${where}: subscription '$sub' is not a subscription ID (GUID)" }
+        $rg = [string]$z.'resource-group'
+        if ($rg -and $rg -notmatch '^[\w\-.()]{1,90}(?<!\.)$') { $problems += "${where}: resource-group '$rg' is not a valid resource group name" }
+        if ($name) {
+            if ($resolved.Contains($name)) { $problems += "${name}: listed more than once" }
+            $resolved[$name] = [pscustomobject]@{
+                dns_zone_prefix = $prefix
+                public_dns_zone = $name
+                subscription_id = $sub
+                resource_group  = $rg
+            }
+        }
+    }
+    if ($problems.Count -gt 0) {
+        Write-Host "$Path has problems:" -ForegroundColor Red
+        foreach ($p in $problems) { Write-Host "  - $p" }
+        exit 1
+    }
+    Write-Host "OK: $($resolved.Count) zone(s) valid, acme-email=$email"
+    if ($staging) { Write-Host "NOTE: acme-staging is true -- certificates chain to an untrusted root." }
+    foreach ($z in $resolved.Values) {
+        Write-Host ("  {0,-10} {1}  subscription={2}  rg={3}" -f $z.dns_zone_prefix, $z.public_dns_zone, $z.subscription_id, $z.resource_group)
+    }
+    return [pscustomobject]@{
+        acme_email       = $email
+        acme_use_staging = $staging
+        hosted_zones     = [pscustomobject]$resolved
+    }
+}
+$zonesDoc = Read-HostedZones "hosted-zones.json"
 
 # ── 2. Resource providers ────────────────────────────────────────────────────
 Write-Host ""
@@ -616,10 +726,6 @@ foreach ($b in $blocked) { Write-Warning "SKIPPED $b" }
 if ($kept.Count -eq 0) {
     Write-Error "Every zone was skipped by the vault guard -- nothing to issue."
     exit 1
-}
-if ($blocked.Count -gt 0) {
-    $zonesDoc.hosted_zones = [pscustomobject]$kept
-    ($zonesDoc | ConvertTo-Json -Depth 5) | Set-Content $TfvarsPath -Encoding utf8
 }
 
 # ── 9. The bootstrap GitHub App ──────────────────────────────────────────────
