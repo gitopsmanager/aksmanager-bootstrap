@@ -322,6 +322,59 @@ function Invoke-AzRetryAuth {
     return $r
 }
 
+# Key Vault secrets, read with PowerShell rather than az.
+#
+# az's Python carries its own list of trusted certificate authorities. Behind a
+# proxy that inspects HTTPS, the vault's certificate is re-signed by the
+# company's root -- trusted by Windows, which IT configures, but not by az -- so
+# every az keyvault call fails CERTIFICATE_VERIFY_FAILED while the ARM calls
+# above, which such proxies tend to leave alone, work (ELAN, 15 Oct 2026).
+# Invoke-RestMethod uses the operating system's store, as the GitHub calls in
+# this script already do. az still does the signing in: only a token comes
+# from it, from Entra, which those machines reach.
+#
+# Same result shape as Invoke-Az, @{ Ok; Data; Err }, and Err carries the words
+# Test-NotFound and the role-wait retry already look for.
+$script:VaultToken = $null
+function Invoke-VaultSecret {
+    param([string] $Vault, [string] $Name, [switch] $Deleted)
+    if (-not $script:VaultToken) {
+        $t = Invoke-Az account get-access-token --resource "https://vault.azure.net" --query accessToken
+        if (-not $t.Ok) { return @{ Ok = $false; Data = $null; Err = "Could not get a Key Vault token from az: $($t.Err)" } }
+        $script:VaultToken = [string]$t.Data
+    }
+    $collection = if ($Deleted) { "deletedsecrets" } else { "secrets" }
+    $uri = "https://$Vault.vault.azure.net/$collection/$([uri]::EscapeDataString($Name))?api-version=7.4"
+    try {
+        $r = Invoke-RestMethod -Method Get -Uri $uri -Headers @{ Authorization = "Bearer $($script:VaultToken)" }
+        return @{ Ok = $true; Data = $r; Err = "" }
+    } catch {
+        $code = $_.Exception.Response.StatusCode.value__
+        $detail = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
+        $word = switch ($code) {
+            404     { "SecretNotFound" }
+            403     { "Forbidden" }
+            401     { "Unauthorized" }
+            $null   { "No response" }
+            default { "HTTP $code" }
+        }
+        return @{ Ok = $false; Data = $null; Err = "$word -- $detail" }
+    }
+}
+
+# Invoke-VaultSecret with the same wait as Invoke-AzRetryAuth: a role granted
+# moments ago (step 5 or 7) can take a few minutes to apply to the vault.
+function Invoke-VaultSecretRetryAuth {
+    param([string] $Vault, [string] $Name, [switch] $Deleted)
+    for ($i = 1; $i -le 12; $i++) {
+        $r = Invoke-VaultSecret -Vault $Vault -Name $Name -Deleted:$Deleted
+        if ($r.Ok -or $r.Err -notmatch 'Forbidden') { return $r }
+        Write-Host "    (waiting for a new role assignment to take effect, $i/12)"
+        Start-Sleep -Seconds 15
+    }
+    return $r
+}
+
 function Get-TokenOid {
     $t = Invoke-Az account get-access-token --query accessToken
     if (-not $t.Ok) { return "" }
@@ -702,7 +755,7 @@ $kept = [ordered]@{}
 foreach ($p in $zonesDoc.hosted_zones.PSObject.Properties) {
     $z = $p.Value
     $secret = ($z.dns_zone_prefix -replace '_', '-') + "-dns-zone-certs"
-    $live = Invoke-AzRetryAuth keyvault secret show --vault-name $KeyVaultName --name $secret --query "{tags:tags}"
+    $live = Invoke-VaultSecretRetryAuth -Vault $KeyVaultName -Name $secret
     if ($live.Ok) {
         $owner = Get-ManagedBy $live.Data.tags
         if ($owner -ne "Terraform") {
@@ -710,14 +763,17 @@ foreach ($p in $zonesDoc.hosted_zones.PSObject.Properties) {
             continue
         }
     } elseif (Test-NotFound $live.Err) {
-        $gone = Invoke-AzRetryAuth keyvault secret show-deleted --vault-name $KeyVaultName --name $secret --query "{tags:tags}"
+        $gone = Invoke-VaultSecretRetryAuth -Vault $KeyVaultName -Name $secret -Deleted
         if ($gone.Ok -and (Get-ManagedBy $gone.Data.tags) -ne "Terraform") {
             $blocked += "$($z.public_dns_zone): $secret was deleted but not purged, and is not the pipeline's. Purge it (az keyvault secret purge --vault-name $KeyVaultName --name $secret) or choose a different prefix."
             continue
         }
     } else {
-        Write-Error "Could not read $secret in $KeyVaultName`n$($live.Err)"
-        exit 1
+        # A warning, not a stop: nothing in setup acts on the guard's answer --
+        # it only reports -- and the job runs the same guard, from inside Azure,
+        # before Terraform writes anything. So an unreadable secret here loses
+        # an early warning, not a protection.
+        Write-Warning "Could not check $secret in $KeyVaultName, so it is not known whether a manual certificate is there. The job checks again before issuing.`n$($live.Err)"
     }
     $kept[$p.Name] = $z
     Write-Host "  ok $($z.dns_zone_prefix) -> $secret"
@@ -734,12 +790,13 @@ if ($kept.Count -eq 0) {
 # the workflow's federated credential, and one token writes the pinned file.
 Write-Host ""
 Write-Host "GitHub App: $AppSecretName"
-$app = Invoke-AzRetryAuth keyvault secret show --vault-name $KeyVaultName --name $AppSecretName --query value
+$app = Invoke-VaultSecretRetryAuth -Vault $KeyVaultName -Name $AppSecretName
 if (-not $app.Ok) {
-    Write-Error "Could not read $AppSecretName from $KeyVaultName -- install the AKS Manager bootstrap GitHub App from Settings first.`n$($app.Err)"
+    $hint = if (Test-NotFound $app.Err) { "install the AKS Manager bootstrap GitHub App from Settings first" } else { "see the error below" }
+    Write-Error "Could not read $AppSecretName from $KeyVaultName -- $hint.`n$($app.Err)"
     exit 1
 }
-$appCreds  = ([string]$app.Data) | ConvertFrom-Json
+$appCreds  = ([string]$app.Data.value) | ConvertFrom-Json
 $GithubOrg = $appCreds.githubOrg
 $GithubInstallId = $appCreds.installId
 # Immutable IDs: GitHub's OIDC sub claim names them for repos created after
