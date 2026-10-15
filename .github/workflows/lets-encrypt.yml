@@ -66,6 +66,35 @@ jobs:
           print(f"job {p['lets_encrypt_job_name']} in {p['shared_services_resource_group']}")
           PY
 
+      # What Azure will be shown. azure/login only says "no matching federated
+      # identity record" when the token's subject differs from the credential
+      # setup created; this prints the subject GitHub actually issues, beside
+      # the identity it is about to be presented to. Claims only -- the token
+      # itself is never printed, so this stays on for every run.
+      - name: Show the sign-in claims
+        env:
+          CLIENT_ID: ${{ steps.setup.outputs.client_id }}
+          TENANT_ID: ${{ steps.setup.outputs.tenant_id }}
+        run: |
+          python3 - <<'PY'
+          import base64, json, os, urllib.parse, urllib.request
+          url = (os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience="
+                 + urllib.parse.quote("api://AzureADTokenExchange", safe=""))
+          req = urllib.request.Request(
+              url, headers={"Authorization": "bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
+          token = json.load(urllib.request.urlopen(req))["value"]
+          body = token.split(".")[1]
+          claims = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+          for k in ("sub", "aud", "iss", "repository", "repository_id",
+                    "repository_owner", "repository_owner_id", "ref"):
+              print(f"{k:20} {claims.get(k)}")
+          print(f"{'identity client id':20} {os.environ['CLIENT_ID']}")
+          print(f"{'tenant':20} {os.environ['TENANT_ID']}")
+          print()
+          print("The federated credential on that identity must have exactly this subject:")
+          print("  " + claims.get("sub", ""))
+          PY
+
       - uses: azure/login@v2
         with:
           client-id: ${{ steps.setup.outputs.client_id }}
