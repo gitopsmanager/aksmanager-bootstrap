@@ -919,27 +919,43 @@ $jobSpec = [ordered]@{
         }
     }
 }
-# JSON is valid YAML, which is what --yaml reads.
-$jobSpecFile = Join-Path ([IO.Path]::GetTempPath()) "aksmanager-job-$([guid]::NewGuid().ToString('N')).yaml"
+# Sent to ARM as is, with az rest -- NOT az containerapp job create/update
+# --yaml. The --yaml path converts the spec's keys between snake_case and
+# camelCase, and that conversion also runs over the KEY of
+# userAssignedIdentities, which is the identity's resource ID. Any underscore
+# in it is eaten and everything after title-cased: resource group ELAAZURE_WEU
+# came out ELAAZUREWeu, and the create failed "...Userassignedidentities/
+# Id-Aksmanager-Letsencrypt was not found" (ELAN, 15 Oct 2026). The spec above
+# is already the ARM resource shape, so a PUT needs no conversion at all -- and
+# PUT is create-or-update, so one call covers both.
+$show = Invoke-Az containerapp job show --resource-group $SharedRg --name $JobName
+if (-not $show.Ok -and -not (Test-NotFound $show.Err)) { Write-Error "Could not read job $JobName`n$($show.Err)"; exit 1 }
+$jobExisted = $show.Ok
+$jobUri = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$SharedRg/providers/Microsoft.App/jobs/${JobName}?api-version=2024-03-01"
+$jobSpecFile = Join-Path ([IO.Path]::GetTempPath()) "aksmanager-job-$([guid]::NewGuid().ToString('N')).json"
 try {
     ($jobSpec | ConvertTo-Json -Depth 12) | Set-Content $jobSpecFile -Encoding utf8
-    $job = Invoke-Az containerapp job show --resource-group $SharedRg --name $JobName
-    if ($job.Ok) {
-        Assert-Az "Updating job $JobName" `
-            (Invoke-Az containerapp job update --resource-group $SharedRg --name $JobName --yaml $jobSpecFile) | Out-Null
-        Write-Host "  ~ updated (image $JobImage, schedule '$JobCron' UTC)"
-    } elseif (Test-NotFound $job.Err) {
-        Assert-Az "Creating job $JobName" `
-            (Invoke-Az containerapp job create --resource-group $SharedRg --name $JobName --yaml $jobSpecFile) | Out-Null
-        Write-Host "  + created (image $JobImage, schedule '$JobCron' UTC)"
-    } else {
-        Write-Error "Could not read job $JobName`n$($job.Err)"; exit 1
-    }
+    Assert-Az "$(if ($jobExisted) { 'Updating' } else { 'Creating' }) job $JobName" `
+        (Invoke-Az rest --method put --uri $jobUri --body "@$jobSpecFile" --headers "Content-Type=application/json") | Out-Null
 } finally {
     Remove-Item $jobSpecFile -ErrorAction SilentlyContinue
 }
-$job = Invoke-Az containerapp job show --resource-group $SharedRg --name $JobName
-Assert-Az "Reading job $JobName" $job | Out-Null
+
+# The PUT returns once ARM accepts it; provisioning -- attaching the identity
+# among it -- finishes afterwards. Wait for the outcome here, so a failure is
+# reported against this step rather than surfacing later as a missing job.
+$jobState = ""
+for ($i = 1; $i -le 40; $i++) {
+    $job = Invoke-Az containerapp job show --resource-group $SharedRg --name $JobName
+    $jobState = if ($job.Ok) { [string]$job.Data.properties.provisioningState } else { "" }
+    if ($jobState -in @("Succeeded", "Failed", "Canceled")) { break }
+    Start-Sleep -Seconds 6
+}
+if ($jobState -ne "Succeeded") {
+    Write-Error "Job $JobName did not finish provisioning (state '$jobState'). The reason is in the activity log of $SharedRg.`n$($job.Err)"
+    exit 1
+}
+Write-Host "  $(if ($jobExisted) { '~ updated' } else { '+ created' }) (image $JobImage, schedule '$JobCron' UTC)"
 $JobId = $job.Data.id
 
 # ── 12. The workflow's identity ──────────────────────────────────────────────
