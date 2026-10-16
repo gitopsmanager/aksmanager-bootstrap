@@ -13,7 +13,10 @@ name: Run lets encrypt certificate job
 #
 # The certificates are issued inside Azure by the job, as its own managed
 # identity. This workflow never sees them: its identity, id-aksmanager-github,
-# can only start and stop the job and read its logs.
+# can start and stop the job, read its logs, and give the job its TXT-only
+# DNS-01 role on a zone added to hosted-zones.json -- that one role, to that
+# one identity, nothing else (setup's conditional grant). Changes to
+# hosted-zones.json are gated by a push ruleset restricting it to approvers.
 #
 # Needs no repository variables. setup-pipeline.ps1 writes everything this
 # reads into pinned.auto.tfvars.json, and creates the federated credential
@@ -60,9 +63,17 @@ jobs:
           if missing:
               sys.exit("pinned.auto.tfvars.json has no " + ", ".join(missing) +
                        " -- re-run setup-pipeline.ps1 (an older run did not create the job).")
+          # For the grant step. Optional, so a pinned file written by an older
+          # setup still runs the job; the grant step then says to re-run setup.
+          optional = {
+              "cert_principal_id": "cert_identity_principal_id",
+              "cert_dns_role":     "cert_dns_role",
+          }
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               for name, key in need.items():
                   out.write(f"{name}={p[key]}\n")
+              for name, key in optional.items():
+                  out.write(f"{name}={p.get(key) or ''}\n")
           print(f"job {p['lets_encrypt_job_name']} in {p['shared_services_resource_group']}")
           PY
 
@@ -100,6 +111,57 @@ jobs:
           client-id: ${{ steps.setup.outputs.client_id }}
           tenant-id: ${{ steps.setup.outputs.tenant_id }}
           subscription-id: ${{ steps.setup.outputs.subscription_id }}
+
+      # The job writes each zone's challenge record as its own identity, which
+      # holds the TXT-only DNS-01 role per public zone. Setup grants it for the
+      # zones it saw; this grants it for any zone added to hosted-zones.json
+      # since, so a new zone needs no setup run.
+      #
+      # This identity may do exactly that and nothing else: setup gives it Role
+      # Based Access Control Administrator under a condition limiting it to
+      # that one role, for that one identity. Which zones reach this step is
+      # gated by the repo -- the sign-in works from main only, and a push
+      # ruleset restricts hosted-zones.json to approvers.
+      - name: Grant DNS challenge access
+        env:
+          JOB_PRINCIPAL_ID: ${{ steps.setup.outputs.cert_principal_id }}
+          DNS_ROLE: ${{ steps.setup.outputs.cert_dns_role }}
+        run: |
+          set -euo pipefail
+          if [ -z "$JOB_PRINCIPAL_ID" ] || [ -z "$DNS_ROLE" ]; then
+            echo "::warning::pinned.auto.tfvars.json is from an older setup, so this workflow cannot grant DNS access for new zones."
+            echo "Re-run setup-pipeline.ps1 once. Zones setup already saw are unaffected."
+            exit 0
+          fi
+
+          granted=0
+          while IFS=$'\t' read -r zone_id zone; do
+            have=$(az role assignment list --assignee-object-id "$JOB_PRINCIPAL_ID" --role "$DNS_ROLE" \
+                     --scope "$zone_id" --query "[?scope=='$zone_id'] | length(@)" -o tsv)
+            if [ "${have:-0}" -gt 0 ]; then
+              echo "= $zone"
+              continue
+            fi
+            az role assignment create --assignee-object-id "$JOB_PRINCIPAL_ID" --assignee-principal-type ServicePrincipal \
+              --role "$DNS_ROLE" --scope "$zone_id" -o none
+            echo "+ $zone: $DNS_ROLE granted"
+            granted=1
+          done < <(python3 - <<'PY'
+          import json
+          doc = json.load(open("hosted-zones.json"))
+          for z in doc["hosted-zones"]:
+              zone_id = (f"/subscriptions/{z['subscription']}/resourceGroups/{z['resource-group']}"
+                         f"/providers/Microsoft.Network/dnszones/{z['public-dns-zone']}")
+              print(f"{zone_id}\t{z['public-dns-zone']}")
+          PY
+          )
+
+          # A new assignment takes a minute or two to apply, and the job would
+          # otherwise meet it as AuthorizationFailed on its first TXT write.
+          if [ "$granted" = 1 ]; then
+            echo "Waiting 120s for the new role assignment(s) to take effect..."
+            sleep 120
+          fi
 
       - name: Start the job and wait for it
         id: run

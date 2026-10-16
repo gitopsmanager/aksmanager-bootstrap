@@ -1024,6 +1024,53 @@ if (-not $starterDef) {
 Grant-Role $gi.Data.principalId "ServicePrincipal" $JobStarterRole $JobId "$GithubIdentity on $JobName"
 Grant-Role $gi.Data.principalId "ServicePrincipal" "Log Analytics Reader" $WorkspaceId "$GithubIdentity on $LogWorkspace"
 
+# Let the workflow give the job its DNS-01 role on a zone added later, so a new
+# zone in hosted-zones.json needs a workflow run rather than another setup run.
+#
+# "Role Based Access Control Administrator", held back by an ABAC condition to
+# one thing: creating or removing assignments of $CertDnsRole, for
+# $CertIdentity. Not another role, not another principal, not itself -- so
+# the most the workflow can ever do is let the certificate job write TXT
+# records in a zone. In each subscription that holds a zone, which is where
+# $CertDnsRole is assignable; a zone in a NEW subscription still needs setup,
+# to make the role assignable there first.
+#
+# Which zones that covers is decided by the repo: the workflow signs in from
+# main only, and a push ruleset restricting hosted-zones.json to approvers is
+# the gate on what reaches it.
+$RbacAdminRole  = "Role Based Access Control Administrator"
+$CertDnsRoleId  = [string]$roleDef.name    # the definition's GUID
+$GithubPrincipalId = $gi.Data.principalId
+$grantCondition = "((!(ActionMatches{'Microsoft.Authorization/roleAssignments/write'})) OR " +
+    "(@Request[Microsoft.Authorization/roleAssignments:RoleDefinitionId] ForAnyOfAnyValues:GuidEquals {$CertDnsRoleId} AND " +
+    "@Request[Microsoft.Authorization/roleAssignments:PrincipalId] ForAnyOfAnyValues:GuidEquals {$CertPrincipalId})) AND " +
+    "((!(ActionMatches{'Microsoft.Authorization/roleAssignments/delete'})) OR " +
+    "(@Resource[Microsoft.Authorization/roleAssignments:RoleDefinitionId] ForAnyOfAnyValues:GuidEquals {$CertDnsRoleId} AND " +
+    "@Resource[Microsoft.Authorization/roleAssignments:PrincipalId] ForAnyOfAnyValues:GuidEquals {$CertPrincipalId}))"
+$normalise = { param($s) ([string]$s -replace '\s', '').ToLowerInvariant() }
+
+foreach ($sub in $zoneSubs) {
+    $scope = "/subscriptions/$sub"
+    $existing = Invoke-Az role assignment list --assignee-object-id $GithubPrincipalId --role $RbacAdminRole --scope $scope
+    $atScope = @(@($existing.Data) | Where-Object { $_ -and $_.scope -eq $scope })
+    if (@($atScope | Where-Object { (& $normalise $_.condition) -eq (& $normalise $grantCondition) }).Count -gt 0) {
+        Write-Host "  = $GithubIdentity may grant $CertDnsRole to $CertIdentity in $scope"
+        continue
+    }
+    # One from an earlier run with another condition -- the job identity or the
+    # role was recreated -- would grant the wrong thing, or nothing. Ours, so
+    # replaced rather than left beside the new one.
+    foreach ($old in $atScope) {
+        Assert-Az "Removing an outdated $RbacAdminRole assignment for $GithubIdentity in $scope" `
+            (Invoke-Az role assignment delete --ids $old.id) | Out-Null
+    }
+    Assert-Az "Letting $GithubIdentity grant $CertDnsRole to $CertIdentity in $scope" `
+        (Invoke-Az role assignment create --assignee-object-id $GithubPrincipalId --assignee-principal-type ServicePrincipal `
+            --role $RbacAdminRole --scope $scope --condition $grantCondition --condition-version "2.0" `
+            --description "GitOps Manager: the Let's Encrypt workflow may grant $CertDnsRole to $CertIdentity, and nothing else") | Out-Null
+    Write-Host "  + $GithubIdentity may grant $CertDnsRole to $CertIdentity in $scope (nothing else)"
+}
+
 # ── 13. pinned.auto.tfvars.json in the private repo ──────────────────────────
 # Settings -> Terraform -> Reload reads it, and the workflow takes the job,
 # the identity and the workspace from it -- no repository variables to set.
@@ -1045,6 +1092,9 @@ $pinned = [ordered]@{
     resource_tag_value                  = $CostTagValue
     state_storage_account               = $StateAccount
     cert_identity_client_id             = $id.Data.clientId
+    # For the workflow's grant step: whom to give the DNS-01 role, and which.
+    cert_identity_principal_id          = $CertPrincipalId
+    cert_dns_role                       = $CertDnsRole
     lets_encrypt_job_name               = $JobName
     container_apps_environment          = $JobEnvironment
     log_analytics_workspace_customer_id = $WorkspaceCustomerId
