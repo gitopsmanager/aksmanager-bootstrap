@@ -7,14 +7,16 @@
       "public-dns-zone": "dev.azure.acme.com",
       "private-dns-zone": "dev.azure.acme.com",
       "subscription": "00000000-0000-0000-0000-000000000000",
-      "resource-group": "rg-dns-dev"
+      "resource-group": "rg-dns-dev",
+      "private-resource-group": "rg-dns-dev"
     },
     {
       "dns-zone-prefix": "we_prod",
       "public-dns-zone": "prod.azure.acme.com",
       "private-dns-zone": "prod.azure.acme.com",
       "subscription": "11111111-1111-1111-1111-111111111111",
-      "resource-group": "rg-dns-prod"
+      "resource-group": "rg-dns-prod",
+      "private-resource-group": "rg-dns-prod"
     }
   ]
 }

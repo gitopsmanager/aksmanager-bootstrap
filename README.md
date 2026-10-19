@@ -42,11 +42,14 @@ Copy `example-hosted-zones.json` to `hosted-zones.json` and fill it in. Each zon
       "public-dns-zone": "dev.azure.acme.com",
       "private-dns-zone": "dev.azure.acme.com",
       "subscription": "00000000-0000-0000-0000-000000000000",
-      "resource-group": "rg-dns-dev"
+      "resource-group": "rg-dns-dev",
+      "private-resource-group": "rg-dns-dev"
     }
   ]
 }
 ```
+
+`resource-group` is the **public** zone's resource group: the certificate job writes its DNS-01 challenge records there. `private-resource-group` is the **private** zone's, used only by AKS Manager for external-dns; it is optional, and when omitted the private zone is taken to be in `resource-group`. Both zones must be in the subscription given.
 
 Unlike AWS there is no per-zone `cert_manager` role to assume. Azure has no assume-role: the identity running the module holds a role assignment on each public zone directly.
 

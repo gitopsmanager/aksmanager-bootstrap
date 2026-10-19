@@ -472,6 +472,10 @@ function Read-HostedZones([string] $Path) {
         if ($sub -and $sub -notmatch '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') { $problems += "${where}: subscription '$sub' is not a subscription ID (GUID)" }
         $rg = [string]$z.'resource-group'
         if ($rg -and $rg -notmatch '^[\w\-.()]{1,90}(?<!\.)$') { $problems += "${where}: resource-group '$rg' is not a valid resource group name" }
+        # Optional: the private zone's resource group, read only by AKS Manager
+        # (external-dns). Checked here so a typo fails now, not at deploy time.
+        $privRg = [string]$z.'private-resource-group'
+        if ($privRg -and $privRg -notmatch '^[\w\-.()]{1,90}(?<!\.)$') { $problems += "${where}: private-resource-group '$privRg' is not a valid resource group name" }
         if ($name) {
             if ($resolved.Contains($name)) { $problems += "${name}: listed more than once" }
             $resolved[$name] = [pscustomobject]@{
