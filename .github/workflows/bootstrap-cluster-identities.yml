@@ -1,0 +1,316 @@
+# Copyright (c) 2026 GitOps Manager, S.L.
+# SPDX-License-Identifier: Apache-2.0
+name: bootstrap-cluster-identities
+
+# Add ONE missing workload identity to an AKS cluster -- external-dns,
+# external-secrets, or aso (the node pool operator) -- with OpenTofu
+# (tofu/cluster-identities). Started by the GUI's "set up new node pools" run
+# (Node pools tab), before the component that needs the identity is
+# installed; the Azure create, when it exists, makes all three the same way.
+#
+# Create-if-missing, never anything else:
+#   - each identity has its own state (identities/<cluster>/<identity>.tfstate
+#     in its own container), and a run continues it, so a run that failed
+#     half way can be re-run
+#   - no state, and an identity of that name already exists: refused. It is
+#     never imported, changed or replaced
+#   - the cluster's OIDC issuer and workload identity must already be on:
+#     turning the issuer on cannot be undone, so it is never done here
+#
+# Signs in as id-aksmanager-identities (setup-pipeline.ps1 step 12b), which
+# may create identities in the shared services resource group and assign
+# four roles and nothing else. Records the identity's client ID in
+# identities/<cluster>.json, where the GUI reads it for stacks/<cluster>.json.
+
+run-name: "Cluster identity ${{ inputs.identity }} for ${{ inputs.cluster }}${{ inputs.dry_run && ' (plan only)' || '' }} -- ${{ inputs.requested_by || github.actor }} [${{ inputs.plan_step }}]"
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster:
+        description: "AKS cluster name"
+        required: true
+        type: string
+      resource_group:
+        description: "The cluster's resource group"
+        required: true
+        type: string
+      subscription_id:
+        description: "The cluster's subscription"
+        required: true
+        type: string
+      identity:
+        description: "Which identity"
+        required: true
+        type: choice
+        options:
+          - aso
+          - external-secrets
+          - external-dns
+      dns_zone_ids:
+        description: "external-dns only: the zones' resource IDs, comma separated"
+        type: string
+        default: ""
+      dry_run:
+        description: "Plan only; change nothing"
+        type: boolean
+        default: false
+      requested_by:
+        description: "The GUI user, when the GUI starts it"
+        type: string
+        default: ""
+      plan_step:
+        description: "The GUI's plan step id, for matching this run (in the run name)"
+        type: string
+        default: ""
+
+permissions:
+  id-token: write
+  contents: write       # identities/<cluster>.json
+  pull-requests: write  # ... committed through a pull request
+
+concurrency:
+  group: cluster-identities-${{ inputs.cluster }}
+  cancel-in-progress: false
+
+jobs:
+  identity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read setup's outputs
+        id: setup
+        env:
+          CLUSTER: ${{ inputs.cluster }}
+          RG: ${{ inputs.resource_group }}
+          SUB: ${{ inputs.subscription_id }}
+          IDENTITY: ${{ inputs.identity }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys
+          c, rg, sub = os.environ["CLUSTER"], os.environ["RG"], os.environ["SUB"]
+          if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}", c): sys.exit(f"Not an AKS cluster name: {c}")
+          if not re.fullmatch(r"[\w\-.()]{1,90}", rg): sys.exit(f"Not a resource group name: {rg}")
+          if not re.fullmatch(r"[0-9a-fA-F-]{36}", sub): sys.exit(f"Not a subscription ID: {sub}")
+          try:
+              p = json.load(open("pinned.auto.tfvars.json"))
+          except FileNotFoundError:
+              sys.exit("pinned.auto.tfvars.json not found -- run setup-pipeline.ps1 first.")
+          need = {
+              "client_id":       "identities_identity_client_id",
+              "tenant_id":       "tenant_id",
+              "shared_sub":      "shared_services_subscription_id",
+              "identity_rg":     "identities_resource_group",
+              "location":        "location",
+              "state_account":   "state_storage_account",
+              "state_container": "identities_state_container",
+              "node_pool_role":  "node_pool_role",
+              "key_vault_name":  "key_vault_name",
+              "key_vault_rg":    "key_vault_resource_group",
+          }
+          missing = [k for k in need.values() if not p.get(k)]
+          if missing:
+              sys.exit("pinned.auto.tfvars.json has no " + ", ".join(missing) +
+                       " -- re-run setup-pipeline.ps1 (step 12b is newer than your last run).")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              for name, key in need.items():
+                  out.write(f"{name}={p[key]}\n")
+              out.write(f"tag_name={p.get('resource_tag_name') or ''}\n")
+              out.write(f"tag_value={p.get('resource_tag_value') or ''}\n")
+          PY
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ steps.setup.outputs.client_id }}
+          tenant-id: ${{ steps.setup.outputs.tenant_id }}
+          subscription-id: ${{ inputs.subscription_id }}
+
+      # The cluster, its workload identity switches, and what the identity's
+      # roles are scoped to.
+      - name: The cluster
+        id: cluster
+        env:
+          CLUSTER: ${{ inputs.cluster }}
+          RG: ${{ inputs.resource_group }}
+          SUB: ${{ inputs.subscription_id }}
+          IDENTITY: ${{ inputs.identity }}
+          ZONES: ${{ inputs.dns_zone_ids }}
+          KV_NAME: ${{ steps.setup.outputs.key_vault_name }}
+          KV_RG: ${{ steps.setup.outputs.key_vault_rg }}
+          SHARED_SUB: ${{ steps.setup.outputs.shared_sub }}
+        run: |
+          set -euo pipefail
+          az aks show -g "$RG" -n "$CLUSTER" --subscription "$SUB" -o json > "$RUNNER_TEMP/aks.json" ||
+            { echo "::error::No AKS cluster $CLUSTER in $RG ($SUB), or this identity cannot read it."; exit 1; }
+          python3 - <<'PY'
+          import json, os, sys
+          aks = json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "aks.json")))
+          issuer = (aks.get("oidcIssuerProfile") or {}).get("enabled")
+          wi = ((aks.get("securityProfile") or {}).get("workloadIdentity") or {}).get("enabled")
+          if not (issuer and wi):
+              sys.exit("::error::Workload identity is not on for this cluster (OIDC issuer "
+                       f"{'on' if issuer else 'off'}, workload identity {'on' if wi else 'off'}). "
+                       "Turning the OIDC issuer on cannot be undone, so it is not done here: "
+                       "az aks update --enable-oidc-issuer --enable-workload-identity, then run again.")
+          vnets = sorted({p["vnetSubnetId"].split("/subnets/")[0]
+                          for p in aks.get("agentPoolProfiles") or [] if p.get("vnetSubnetId")})
+          ident = os.environ["IDENTITY"]
+          zones = [z.strip() for z in os.environ["ZONES"].split(",") if z.strip()]
+          if ident == "external-dns" and not zones:
+              sys.exit("::error::external-dns needs dns_zone_ids: the zones it writes to.")
+          kv = (f"/subscriptions/{os.environ['SHARED_SUB']}/resourceGroups/{os.environ['KV_RG']}"
+                f"/providers/Microsoft.KeyVault/vaults/{os.environ['KV_NAME']}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"cluster_id={aks['id']}\n")
+              out.write(f"oidc_issuer={aks['oidcIssuerProfile']['issuerUrl']}\n")
+              out.write(f"vnets={json.dumps(vnets)}\n")
+              out.write(f"zones={json.dumps(zones)}\n")
+              out.write(f"key_vault_id={kv}\n")
+          print(f"{aks['name']}: workload identity on; node pool VNets {vnets or 'none (kubenet / managed VNet)'}")
+          PY
+
+      # Create-if-missing.
+      - name: Already there?
+        id: check
+        env:
+          CLUSTER: ${{ inputs.cluster }}
+          IDENTITY: ${{ inputs.identity }}
+          SHARED_SUB: ${{ steps.setup.outputs.shared_sub }}
+          IDENTITY_RG: ${{ steps.setup.outputs.identity_rg }}
+          STATE_ACCOUNT: ${{ steps.setup.outputs.state_account }}
+          STATE_CONTAINER: ${{ steps.setup.outputs.state_container }}
+        run: |
+          set -euo pipefail
+          key="identities/$CLUSTER/$IDENTITY.tfstate"
+          if [ "$(az storage blob exists --account-name "$STATE_ACCOUNT" --container-name "$STATE_CONTAINER" \
+                    --name "$key" --auth-mode login --query exists -o tsv)" = true ]; then
+            echo "State $key exists: continuing it."
+            exit 0
+          fi
+          name="$CLUSTER-$IDENTITY"
+          if az identity show -n "$name" -g "$IDENTITY_RG" --subscription "$SHARED_SUB" -o none 2>/dev/null; then
+            echo "::error::$name already exists in $IDENTITY_RG but was not made by this workflow (no state at $key). It is never imported or changed here."
+            exit 1
+          fi
+          echo "$name does not exist: creating it."
+
+      - name: OpenTofu
+        run: |
+          set -euo pipefail
+          TOFU_VERSION=1.13.1
+          base="https://github.com/opentofu/opentofu/releases/download/v${TOFU_VERSION}"
+          cd "$RUNNER_TEMP"
+          curl -fsSLO "${base}/tofu_${TOFU_VERSION}_linux_amd64.zip"
+          curl -fsSLO "${base}/tofu_${TOFU_VERSION}_SHA256SUMS"
+          grep " tofu_${TOFU_VERSION}_linux_amd64.zip\$" "tofu_${TOFU_VERSION}_SHA256SUMS" | sha256sum -c -
+          unzip -q -o "tofu_${TOFU_VERSION}_linux_amd64.zip" tofu -d "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Plan and apply
+        id: apply
+        working-directory: tofu/cluster-identities
+        env:
+          ARM_USE_CLI: "true"
+          ARM_TENANT_ID: ${{ steps.setup.outputs.tenant_id }}
+          ARM_SUBSCRIPTION_ID: ${{ inputs.subscription_id }}
+          TF_IN_AUTOMATION: "1"
+          CLUSTER: ${{ inputs.cluster }}
+          RG: ${{ inputs.resource_group }}
+          SUB: ${{ inputs.subscription_id }}
+          IDENTITY: ${{ inputs.identity }}
+          IDENTITY_RG: ${{ steps.setup.outputs.identity_rg }}
+          LOCATION: ${{ steps.setup.outputs.location }}
+          ZONES: ${{ steps.cluster.outputs.zones }}
+          VNETS: ${{ steps.cluster.outputs.vnets }}
+          KV_ID: ${{ steps.cluster.outputs.key_vault_id }}
+          CLUSTER_ID: ${{ steps.cluster.outputs.cluster_id }}
+          OIDC_ISSUER: ${{ steps.cluster.outputs.oidc_issuer }}
+          NODE_POOL_ROLE: ${{ steps.setup.outputs.node_pool_role }}
+          TAG_NAME: ${{ steps.setup.outputs.tag_name }}
+          TAG_VALUE: ${{ steps.setup.outputs.tag_value }}
+          SHARED_SUB: ${{ steps.setup.outputs.shared_sub }}
+          STATE_ACCOUNT: ${{ steps.setup.outputs.state_account }}
+          STATE_CONTAINER: ${{ steps.setup.outputs.state_container }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          tags = {"AKSManager": "Managed", "deployed_by": "GitOpsManager", "managed_by": "OpenTofu",
+                  "cluster": os.environ["CLUSTER"]}
+          if os.environ["TAG_NAME"]:
+              tags[os.environ["TAG_NAME"]] = os.environ["TAG_VALUE"]
+          json.dump({
+              "cluster": {"name": os.environ["CLUSTER"], "resource_group": os.environ["RG"],
+                          "subscription_id": os.environ["SUB"], "id": os.environ["CLUSTER_ID"],
+                          "oidc_issuer_url": os.environ["OIDC_ISSUER"]},
+              "identity": os.environ["IDENTITY"],
+              "identity_resource_group": os.environ["IDENTITY_RG"],
+              "location": os.environ["LOCATION"],
+              "tags": tags,
+              "dns_zone_ids": json.loads(os.environ["ZONES"]),
+              "key_vault_id": os.environ["KV_ID"],
+              "aso_role_name": os.environ["NODE_POOL_ROLE"],
+              "subnet_vnet_ids": json.loads(os.environ["VNETS"]),
+          }, open("identity.auto.tfvars.json", "w"), indent=2)
+          PY
+          tofu init -input=false \
+            "-backend-config=storage_account_name=${STATE_ACCOUNT}" \
+            "-backend-config=container_name=${STATE_CONTAINER}" \
+            "-backend-config=key=identities/${CLUSTER}/${IDENTITY}.tfstate" \
+            "-backend-config=subscription_id=${SHARED_SUB}" \
+            "-backend-config=tenant_id=${ARM_TENANT_ID}"
+          set +e
+          tofu plan -input=false -detailed-exitcode -out=tfplan
+          rc=$?
+          set -e
+          case "$rc" in 0) echo "No changes" ;; 2) echo "Changes planned" ;; *) echo "::error::plan failed"; exit 1 ;; esac
+          if [ "$DRY_RUN" = true ]; then
+            echo "Plan only: nothing applied." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          [ "$rc" = 2 ] && tofu apply -input=false tfplan
+          echo "client_id=$(tofu output -raw client_id)" >> "$GITHUB_OUTPUT"
+
+      # Where the GUI reads it: identities/<cluster>.json, one key per identity.
+      - name: Record the client ID
+        if: ${{ !inputs.dry_run }}
+        env:
+          CLUSTER: ${{ inputs.cluster }}
+          IDENTITY: ${{ inputs.identity }}
+          CLIENT_ID: ${{ steps.apply.outputs.client_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p identities
+          python3 - <<'PY'
+          import json, os
+          path = f"identities/{os.environ['CLUSTER']}.json"
+          try:
+              doc = json.load(open(path))
+          except FileNotFoundError:
+              doc = {}
+          doc[os.environ["IDENTITY"]] = {"client_id": os.environ["CLIENT_ID"]}
+          json.dump(doc, open(path, "w"), indent=2, sort_keys=True)
+          open(path, "a").write("\n")
+          PY
+          echo "$IDENTITY identity for $CLUSTER: client ID $CLIENT_ID" >> "$GITHUB_STEP_SUMMARY"
+
+      # Through a pull request squash-merged with retries
+      # (gitopsmanager/Auto-Commit-Squash-Merge): another run's record is
+      # merged with, never overwritten. Needs the repository to allow GitHub
+      # Actions to create pull requests.
+      - name: Commit the client ID
+        if: ${{ !inputs.dry_run }}
+        uses: gitopsmanager/Auto-Commit-Squash-Merge@v2
+        with:
+          token: ${{ github.token }}
+          repo_owner: ${{ github.repository_owner }}
+          repo_name: ${{ github.event.repository.name }}
+          path: .
+          repo_path_rel: identities
+          cluster: ${{ inputs.cluster }}
+          skip_if_unchanged: "true"
+          push_auth: token
+          commit_message: "Cluster identity ${{ inputs.identity }} for ${{ inputs.cluster }} (run ${{ github.run_id }})"

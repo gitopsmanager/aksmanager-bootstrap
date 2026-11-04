@@ -1,0 +1,44 @@
+{
+  "_comment": [
+    "setup-pipeline.ps1 CREATES this role itself (as AKSManagerCertManager) when it",
+    "does not exist, and assigns it to the certificate job's identity on each",
+    "PUBLIC zone in hosted-zones.json. This file is the same definition, for",
+    "reference or for creating it yourself:",
+    "",
+    "  az role definition create --role-definition @example-cert-manager-role.json",
+    "",
+    "after replacing SUBSCRIPTION_ID in AssignableScopes with every subscription",
+    "that holds one of your public zones, and deleting this _comment key (az",
+    "rejects unknown keys). An existing definition's permissions are never",
+    "changed by setup, so a narrower one of your own is kept.",
+    "",
+    "To use a different role instead (e.g. the built-in DNS Zone Contributor,",
+    "which allows every record type in the zone), set CERT_DNS_ROLE before",
+    "running setup; nothing is then created.",
+    "",
+    "Assigned at ZONE scope, never record-set scope: lego deletes the",
+    "_acme-challenge record after validating, which would delete a record-set",
+    "assignment with it.",
+    "",
+    "This is the tightest role in the system: TXT records in one zone, and",
+    "nothing else. It cannot create or change A or CNAME records, so it could not",
+    "be used to repoint a hostname. It is one step wider than the AWS equivalent,",
+    "which is also limited to names beginning _acme-challenge -- Azure RBAC has no",
+    "condition on DNS record names."
+  ],
+  "Name": "AKSManagerCertManager",
+  "IsCustom": true,
+  "Description": "Write TXT records in a public DNS zone for Let's Encrypt DNS-01 validation. Nothing else.",
+  "Actions": [
+    "Microsoft.Network/dnsZones/read",
+    "Microsoft.Network/dnsZones/TXT/read",
+    "Microsoft.Network/dnsZones/TXT/write",
+    "Microsoft.Network/dnsZones/TXT/delete"
+  ],
+  "NotActions": [],
+  "DataActions": [],
+  "NotDataActions": [],
+  "AssignableScopes": [
+    "/subscriptions/SUBSCRIPTION_ID"
+  ]
+}
