@@ -51,7 +51,8 @@
          bootstrap-cluster-identities.yml can add a missing workload identity
          (external-dns, external-secrets, ASO) to an AKS cluster. Its own state
          container, and the right to assign four roles and no others. Also the
-         node pool operator's role, AKSManagerNodePoolOperator.
+         node pool operator's role, AKSManagerNodePoolOperator, and the right to
+         write (never read) secrets in the vault, AKSManagerVaultEntryWriter.
      13. pinned.auto.tfvars.json written to your private repo. Settings ->
          Terraform -> Reload reads it, and so do the workflows.
 
@@ -1335,6 +1336,31 @@ foreach ($sub in $idSubs) {
             --description "GitOps Manager: the cluster identities workflow may assign Key Vault Secrets User, DNS Zone Contributor, Private DNS Zone Contributor and $NodePoolRole to service principals, and nothing else") | Out-Null
     Write-Host "  + $IdentitiesIdentity may assign the four identity roles in $scope (nothing else)"
 }
+
+# It writes the aso identity's client ID to the vault for the operator's settings.
+# Write only: Key Vault Secrets Officer would let it read every secret there.
+$VaultWriterRole = "AKSManagerVaultEntryWriter"
+$writerDef = Get-RoleDefinition $VaultWriterRole "/subscriptions/$SubscriptionId"
+if (-not $writerDef) {
+    $writerTmp = Join-Path ([IO.Path]::GetTempPath()) "aksmanager-vault-writer-role-$([guid]::NewGuid().ToString('N')).json"
+    try {
+        ([ordered]@{
+            Name             = $VaultWriterRole
+            IsCustom         = $true
+            Description      = "GitOps Manager: write secrets in a Key Vault, and never read their values."
+            Actions          = @()
+            NotActions       = @()
+            DataActions      = @("Microsoft.KeyVault/vaults/secrets/setSecret/action")
+            NotDataActions   = @()
+            AssignableScopes = @("/subscriptions/$SubscriptionId")
+        } | ConvertTo-Json -Depth 4) | Set-Content $writerTmp -Encoding utf8
+        Assert-Az "Creating role $VaultWriterRole" (Invoke-Az role definition create --role-definition "@$writerTmp") | Out-Null
+        Write-Host "  + role $VaultWriterRole created"
+    } finally {
+        Remove-Item $writerTmp -ErrorAction SilentlyContinue
+    }
+}
+Grant-Role $IdentitiesPrincipalId "ServicePrincipal" $VaultWriterRole $KeyVaultId $IdentitiesIdentity
 
 # ── 13. pinned.auto.tfvars.json in the private repo ──────────────────────────
 # Settings -> Terraform -> Reload reads it, and the workflow takes the job,

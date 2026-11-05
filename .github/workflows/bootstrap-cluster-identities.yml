@@ -285,6 +285,22 @@ jobs:
           [ "$rc" = 2 ] && tofu apply -input=false tfplan
           echo "client_id=$(tofu output -raw client_id)" >> "$GITHUB_OUTPUT"
 
+      # Where the operator's settings read it (private-core-stack's
+      # azure-service-operator chart). Every run, so re-running fixes a cluster
+      # whose identity came before this step, and a changed ID.
+      - name: Write the client ID to the vault
+        if: ${{ !inputs.dry_run && inputs.identity == 'aso' }}
+        env:
+          CLUSTER: ${{ inputs.cluster }}
+          CLIENT_ID: ${{ steps.apply.outputs.client_id }}
+          KV_NAME: ${{ steps.setup.outputs.key_vault_name }}
+        run: |
+          set -euo pipefail
+          [ -n "$CLIENT_ID" ] || { echo "::error::No client ID from OpenTofu"; exit 1; }
+          az keyvault secret set --vault-name "$KV_NAME" --name "$CLUSTER-aso-client-id" --value "$CLIENT_ID" \
+            --tags managed_by=AKSManagerAgent deployed_by=GitOpsManager --output none ||
+            { echo "::error::Could not write $CLUSTER-aso-client-id to $KV_NAME. If this identity lacks the role, re-run setup-pipeline.ps1 (step 12b)."; exit 1; }
+
       # Where the GUI reads it: identities/<cluster>.json, one key per identity.
       - name: Record the client ID
         if: ${{ !inputs.dry_run }}

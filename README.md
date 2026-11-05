@@ -41,7 +41,10 @@ already exists; the GUI starts it when a cluster's node pools move to the CD
 repo. It is **create-if-missing**: it refuses an identity of the same name it
 did not make, never imports, changes or replaces one, and refuses a cluster
 whose OIDC issuer or workload identity is off (turning the issuer on cannot be
-undone). It records each client ID in `identities/<cluster>.json`. It signs in
+undone). It records each client ID in `identities/<cluster>.json`, and for `aso`
+also writes it to Key Vault as `<cluster>-aso-client-id`, where the operator's
+settings read it. Re-running it adds that entry for an identity made before
+this step. It signs in
 as `id-aksmanager-identities` (setup step 12b), which may create identities in
 the shared services resource group and assign those four roles and no others.
 
