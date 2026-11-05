@@ -20,7 +20,9 @@ name: bootstrap-cluster-identities
 # Signs in as id-aksmanager-identities (setup-pipeline.ps1 step 12b), which
 # may create identities in the shared services resource group and assign
 # four roles and nothing else. Records the identity's client ID in
-# identities/<cluster>.json, where the GUI reads it for stacks/<cluster>.json.
+# identities/<cluster>.json, where the GUI reads it for stacks/<cluster>.json,
+# committed as the GitHub App: repository variable GOM_APP_CLIENT_ID and secret
+# GOM_APP_PRIVATE_KEY, both required.
 
 run-name: "Cluster identity ${{ inputs.identity }} for ${{ inputs.cluster }}${{ inputs.dry_run && ' (plan only)' || '' }} -- ${{ inputs.requested_by || github.actor }} [${{ inputs.plan_step }}]"
 
@@ -66,8 +68,7 @@ on:
 
 permissions:
   id-token: write
-  contents: write       # identities/<cluster>.json
-  pull-requests: write  # ... committed through a pull request
+  contents: read
 
 concurrency:
   group: cluster-identities-${{ inputs.cluster }}
@@ -79,6 +80,16 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+
+      # The record at the end is committed as the GitHub App: fail now, not after
+      # the run has done its work.
+      - name: Check the GitHub App
+        if: ${{ !inputs.dry_run }}
+        env:
+          APP_ID: ${{ vars.GOM_APP_CLIENT_ID }}
+          APP_KEY: ${{ secrets.GOM_APP_PRIVATE_KEY }}
+        run: |
+          [ -n "$APP_ID" ] && [ -n "$APP_KEY" ] || { echo "::error::The GitHub App is required: repository variable GOM_APP_CLIENT_ID and secret GOM_APP_PRIVATE_KEY"; exit 1; }
 
       - name: Read setup's outputs
         id: setup
@@ -297,15 +308,25 @@ jobs:
           PY
           echo "$IDENTITY identity for $CLUSTER: client ID $CLIENT_ID" >> "$GITHUB_STEP_SUMMARY"
 
+      # Made here, not earlier: an App token lasts an hour.
+      - name: Token for this repo
+        id: record_app
+        if: ${{ !inputs.dry_run }}
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.GOM_APP_CLIENT_ID }}
+          private-key: ${{ secrets.GOM_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
       # Through a pull request squash-merged with retries
       # (gitopsmanager/Auto-Commit-Squash-Merge): another run's record is
-      # merged with, never overwritten. Needs the repository to allow GitHub
-      # Actions to create pull requests.
+      # merged with, never overwritten. As the GitHub App.
       - name: Commit the client ID
         if: ${{ !inputs.dry_run }}
         uses: gitopsmanager/Auto-Commit-Squash-Merge@v2
         with:
-          token: ${{ github.token }}
+          token: ${{ steps.record_app.outputs.token }}
           repo_owner: ${{ github.repository_owner }}
           repo_name: ${{ github.event.repository.name }}
           path: .

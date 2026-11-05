@@ -47,13 +47,11 @@ the shared services resource group and assign those four roles and no others.
 
 Workflows that record something here (`identities/<cluster>.json`) commit it through a pull
 request that is squash-merged at once (gitopsmanager/Auto-Commit-Squash-Merge),
-so two runs at the same time are merged, never overwritten. They use the run's
-own token, which GitHub lets open pull requests only when **Settings ->
-Actions -> General -> Workflow permissions -> Allow GitHub Actions to create
-and approve pull requests** is on (or the same setting for the whole
-organisation). It is off by default; without it the record step fails. With a
-required review on `main`, allow GitHub Actions to bypass it, or the merge
-waits for a review that never comes.
+so two runs at the same time are merged, never overwritten. They commit it as a GitHub App, so install one on this repository with
+**Contents** and **Pull requests** read and write, then set the repository
+variable `GOM_APP_CLIENT_ID` and the secret `GOM_APP_PRIVATE_KEY`. Without them
+the run stops at its first step. With a required review on `main`, allow the App
+to bypass it, or the merge waits for a review that never comes.
 
 ## Certificates: `tofu/lets-encrypt`
 
