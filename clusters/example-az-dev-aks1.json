@@ -1,0 +1,38 @@
+{
+  "name": "example-az-dev-aks1",
+  "subscription_id": "00000000-0000-0000-0000-000000000000",
+  "resource_group": "rg-client-dev-aks",
+  "location": "westeurope",
+  "zone_prefix": "az-dev",
+  "dns_zone": "az-dev.client.example.com",
+  "kubernetes_version": "1.33",
+  "zones": ["1", "2", "3"],
+  "tier": "standard",
+  "network": {
+    "subnet_id": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-client-network/providers/Microsoft.Network/virtualNetworks/vnet-client-dev/subnets/snet-aks",
+    "plugin": "azure",
+    "plugin_mode": "overlay",
+    "policy": "cilium",
+    "dataplane": "cilium",
+    "pod_cidr": "192.168.0.0/16",
+    "service_cidr": "10.0.0.0/16",
+    "dns_service_ip": "10.0.0.10"
+  },
+  "entra": {
+    "enabled": true,
+    "azure_rbac": true,
+    "admin_group_object_ids": ["11111111-1111-1111-1111-111111111111"]
+  },
+  "upgrade": {
+    "auto_upgrade_channel": "none",
+    "node_os_upgrade_channel": "NodeImage"
+  },
+  "maintenance": {
+    "node_os": { "day_of_week": "Saturday", "interval_weeks": 1, "duration": 4, "utc_offset": "+00:00", "start_time": "02:00" }
+  },
+  "node_pools": {
+    "system": { "vm_size": "Standard_D4s_v5", "count": 3, "disk_size": 128, "disk_type": "Managed" },
+    "general": { "vm_size": "Standard_D8s_v5", "count": 3, "disk_size": 128, "disk_type": "Managed" }
+  },
+  "global_namespaces": ["monitoring"]
+}

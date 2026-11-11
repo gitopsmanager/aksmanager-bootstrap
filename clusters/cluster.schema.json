@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/gitopsmanager/aksmanager-bootstrap/clusters/cluster.schema.json",
+  "title": "AKS cluster definition",
+  "description": "clusters/<name>.json, read by bootstrap-create-cluster.yml. Files named example-*.json are examples and never created. scripts/create_cluster.py enforces the same rules and the cross-field ones (Cilium, overlay, the DNS service IP); it has no jsonschema dependency.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "subscription_id", "resource_group", "location", "zone_prefix", "dns_zone", "kubernetes_version", "network", "node_pools"],
+  "$defs": {
+    "guid": { "type": "string", "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$" },
+    "pool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vm_size", "count", "disk_size"],
+      "properties": {
+        "vm_size": { "type": "string", "pattern": "^Standard_[A-Za-z0-9_]+$" },
+        "count": { "description": "Nodes in all (system: at least 1).", "type": "integer", "minimum": 0 },
+        "disk_size": { "description": "OS disk, GB.", "type": "integer", "minimum": 30 },
+        "disk_type": { "enum": ["Managed", "Ephemeral"], "default": "Managed" }
+      }
+    },
+    "window": {
+      "description": "A weekly maintenance window (the agent's create_maintenance_schedules).",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "day_of_week": { "enum": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"], "default": "Saturday" },
+        "interval_weeks": { "type": "integer", "minimum": 1, "maximum": 4, "default": 1 },
+        "duration": { "description": "Hours.", "type": "integer", "minimum": 4, "maximum": 24, "default": 4 },
+        "utc_offset": { "type": "string", "pattern": "^[+-][0-9]{2}:[0-9]{2}$", "default": "+00:00" },
+        "start_time": { "type": "string", "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9])?$", "default": "00:00" },
+        "start_date": { "description": "YYYY-MM-DD; empty for the day it is created.", "type": "string", "default": "" }
+      }
+    }
+  },
+  "properties": {
+    "name": {
+      "description": "Cluster name. Must match the file name. Letters, digits and '-', 1-63 characters, starting and ending with a letter or digit ('_' is not allowed).",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
+    },
+    "subscription_id": { "$ref": "#/$defs/guid" },
+    "resource_group": { "description": "Made by the workflow if it doesn't exist (as the agent's create).", "type": "string" },
+    "location": { "description": "Azure region, e.g. westeurope.", "type": "string", "pattern": "^[a-z0-9]+$" },
+    "zone_prefix": { "description": "The environment's zone prefix: letters, digits and '-'.", "type": "string", "pattern": "^[A-Za-z0-9-]+$" },
+    "dns_zone": { "type": "string" },
+    "kubernetes_version": { "description": "Major.minor (the newest patch AKS offers) or an exact patch.", "type": "string", "pattern": "^1\\.[0-9]{2}(\\.[0-9]+)?$" },
+    "zones": {
+      "description": "Availability zones; [] for a regional cluster. The bootstrap pool has one node per zone, as the agent's first pool.",
+      "type": "array",
+      "items": { "enum": ["1", "2", "3"] },
+      "uniqueItems": true,
+      "default": []
+    },
+    "tier": { "enum": ["free", "standard", "premium"], "default": "free" },
+    "network": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["subnet_id", "plugin", "policy", "service_cidr", "dns_service_ip"],
+      "properties": {
+        "subnet_id": { "description": "The node subnet's resource ID.", "type": "string" },
+        "plugin": { "enum": ["azure", "kubenet", "none"] },
+        "plugin_mode": { "description": "overlay needs plugin azure.", "enum": ["transparent", "overlay"], "default": "transparent" },
+        "policy": { "description": "cilium needs dataplane cilium.", "enum": ["azure", "calico", "cilium", "none"] },
+        "dataplane": { "description": "Azure CNI Powered by Cilium: needs plugin azure, plugin_mode overlay and policy cilium.", "enum": ["", "cilium"], "default": "" },
+        "pod_cidr": { "description": "Overlay only; must not overlap service_cidr, the VNet or anything routed to it.", "type": "string", "default": "" },
+        "service_cidr": { "type": "string" },
+        "dns_service_ip": { "description": "Inside service_cidr, not its first address.", "type": "string" },
+        "traefik_ip": { "description": "Traefik's private IP; empty for the subnet's address with the last octet 100, as the agent.", "type": "string", "default": "" }
+      }
+    },
+    "entra": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": { "description": "Managed Entra ID (--enable-aad).", "type": "boolean" },
+        "azure_rbac": { "description": "Azure RBAC for Kubernetes (--enable-azure-rbac); needs enabled.", "type": "boolean", "default": false },
+        "admin_group_object_ids": { "type": "array", "items": { "$ref": "#/$defs/guid" }, "default": [] }
+      }
+    },
+    "upgrade": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "auto_upgrade_channel": { "enum": ["none", "patch", "stable", "rapid", "node-image"], "default": "none" },
+        "node_os_upgrade_channel": { "enum": ["None", "Unmanaged", "SecurityPatch", "NodeImage"], "default": "NodeImage" }
+      }
+    },
+    "maintenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "auto_upgrade": { "$ref": "#/$defs/window" },
+        "node_os": { "$ref": "#/$defs/window" }
+      }
+    },
+    "container_registry": {
+      "description": "The registry the kubelet identity may pull from (AcrPull), in the shared services subscription. Default: setup's.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "resource_group"],
+      "properties": {
+        "name": { "type": "string", "pattern": "^[A-Za-z0-9]{5,50}$" },
+        "resource_group": { "type": "string" }
+      }
+    },
+    "node_pools": {
+      "description": "The pools the handover makes through the Azure Service Operator. system's size and disk are also the bootstrap pool's.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["system", "general"],
+      "properties": {
+        "system": { "$ref": "#/$defs/pool" },
+        "general": { "$ref": "#/$defs/pool" }
+      }
+    },
+    "global_namespaces": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$" },
+      "default": []
+    }
+  }
+}

@@ -1,0 +1,476 @@
+# Copyright (c) 2026 GitOps Manager, S.L.
+# SPDX-License-Identifier: Apache-2.0
+# Create one AKS cluster from clusters/<cluster>.json, with Terraform. The AKS
+# counterpart of eksmanager-bootstrap's and gkemanager-bootstrap's
+# bootstrap-create-cluster.yml, porting the agent's Azure create
+# (azureapi.create_aks_cluster and the CreateCluster step in task.py).
+#
+#   validate the cluster file
+#   -> the resource group, made if missing (the agent's create_resource_group)
+#   -> 1-cluster (identities, roles, Traefik's NIC, the cluster with its
+#      bootstrap pool, maintenance windows); the Traefik NIC is then forgotten
+#   -> the ASO identity (terraform/cluster-identities, the state
+#      bootstrap-cluster-identities.yml carries on)
+#   -> 2-platform (the default-retain StorageClass, namespaces, the Argo CD
+#      admin password, Argo CD)
+#   -> record it (clusters/<cluster>.outputs.json, identities/<cluster>.json)
+#
+# Then the core stack (core-stack's install-core-stack.yml), and the handover:
+# the system and general pools through the Azure Service Operator, then the
+# bootstrap pool deleted (terraform/create-cluster/README.md, "3-handover").
+#
+# Safe to re-run: each stage is its own state, and a stage that is up to date
+# plans no changes. Two runs for the same cluster queue rather than race.
+#
+# Runs on GitOps Manager's long-job runner on Azure (label gom-azure-long: a
+# Container Apps job, core-stack's terraform/runners-azure) as the runners' managed
+# identity. Elsewhere (CREATE_CLUSTER_RUNNER, e.g. GitHub's runners) it signs
+# in through workload identity federation as AZURE_CREATE_CLIENT_ID instead.
+# Either identity needs the roles in terraform/create-cluster/README.md.
+#
+# Setup's pinned.auto.tfvars.json (setup-pipeline.ps1) gives the tenant, the
+# shared services subscription, the Key Vault, the state storage and the ASO
+# roles: no repository variables for those.
+#
+# Repository variables:
+#   CREATE_CLUSTER_RUNNER    optional: runs-on (default gom-azure-long)
+#   AZURE_CREATE_CLIENT_ID   with it: the identity the run signs in as (OIDC)
+#   GOM_APP_CLIENT_ID        the GitHub App that commits the record (secret
+#                            GOM_APP_PRIVATE_KEY); required
+#   CD_REPO                  owner/name of the CD repo
+#   CORE_STACK_REF           the core-stack tag or commit Argo CD comes from
+#   CORE_STACK_REPO          optional: owner/name of the core-stack repo (default
+#                            gitopsmanager/core-stack, public); a private one is
+#                            read as the GitHub App
+#   TERRAFORM_VERSION             optional: not used; the workflow installs Terraform 1.17.1
+name: bootstrap-create-cluster
+
+run-name: "Create AKS cluster ${{ inputs.cluster }}${{ inputs.dry_run && ' (plan only)' || '' }} -- ${{ inputs.requested_by || github.actor }} [${{ inputs.plan_step }}]"
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster:
+        description: "Cluster name: clusters/<cluster>.json"
+        required: true
+        type: string
+      cluster_json:
+        description: "Optional: the cluster file's content, written to clusters/<cluster>.json for this run (and committed with the record)"
+        type: string
+        default: ""
+      dry_run:
+        description: "Validate the file and plan 1-cluster only; change nothing"
+        type: boolean
+        default: false
+      requested_by:
+        description: "The GUI user, when the GUI starts it"
+        type: string
+        default: ""
+      plan_step:
+        description: "The GUI's plan step id, for matching this run (in the run name)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write    # workload identity federation, off our runner
+
+concurrency:
+  group: create-cluster-${{ inputs.cluster }}
+  cancel-in-progress: false
+
+env:
+  TFVARS: build/create-cluster/create.auto.tfvars.json
+  ARM_USE_CLI: "true"
+  TF_IN_AUTOMATION: "1"
+
+jobs:
+  create:
+    runs-on: ${{ vars.CREATE_CLUSTER_RUNNER || 'gom-azure-long' }}
+    # az aks create alone may take an hour (the agent's AZ_CLI_AKS_CREATE).
+    timeout-minutes: 120
+    steps:
+      - name: Check out this repo
+        uses: actions/checkout@v7
+
+      # The record at the end is committed as the GitHub App: fail now, not after
+      # the run has done its work.
+      - name: Check the GitHub App
+        if: ${{ !inputs.dry_run }}
+        env:
+          APP_ID: ${{ vars.GOM_APP_CLIENT_ID }}
+          APP_KEY: ${{ secrets.GOM_APP_PRIVATE_KEY }}
+        run: |
+          [ -n "$APP_ID" ] && [ -n "$APP_KEY" ] || { echo "::error::The GitHub App is required: repository variable GOM_APP_CLIENT_ID and secret GOM_APP_PRIVATE_KEY"; exit 1; }
+
+      - name: Token for the core-stack repo
+        id: core_stack_app
+        if: ${{ vars.CORE_STACK_REPO != '' && vars.CORE_STACK_REPO != 'gitopsmanager/core-stack' }}
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.GOM_APP_CLIENT_ID }}
+          private-key: ${{ secrets.GOM_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Check out core-stack (Argo CD's chart)
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.CORE_STACK_REPO || 'gitopsmanager/core-stack' }}
+          ref: ${{ vars.CORE_STACK_REF }}
+          path: core-stack
+          token: ${{ steps.core_stack_app.outputs.token || github.token }}
+          persist-credentials: false
+
+      - name: The cluster file
+        env:
+          CLUSTER: ${{ inputs.cluster }}
+          CLUSTER_JSON: ${{ inputs.cluster_json }}
+        run: |
+          set -euo pipefail
+          [[ "$CLUSTER" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] || { echo "::error::Not a cluster name: $CLUSTER"; exit 1; }
+          case "$CLUSTER" in example-*) echo "::error::example-* files are examples and never created"; exit 1 ;; esac
+          if [ -n "$CLUSTER_JSON" ]; then
+            printf '%s' "$CLUSTER_JSON" | python3 -c 'import json, sys; json.dump(json.load(sys.stdin), open(sys.argv[1], "w"), indent=2); open(sys.argv[1], "a").write("\n")' "clusters/$CLUSTER.json"
+            echo "Using the cluster file given to the run."
+          fi
+          [ -f "clusters/$CLUSTER.json" ] || { echo "::error::clusters/$CLUSTER.json not found"; exit 1; }
+
+      # Setup's outputs: the same file bootstrap-cluster-identities.yml reads.
+      - name: Read setup's outputs
+        id: setup
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          try:
+              p = json.load(open("pinned.auto.tfvars.json"))
+          except FileNotFoundError:
+              sys.exit("::error::pinned.auto.tfvars.json not found -- run setup-pipeline.ps1 first.")
+          need = {
+              "tenant_id":       "tenant_id",
+              "shared_sub":      "shared_services_subscription_id",
+              "identity_rg":     "identities_resource_group",
+              "state_account":   "state_storage_account",
+              "state_container": "identities_state_container",
+              "key_vault_name":  "key_vault_name",
+              "key_vault_rg":    "key_vault_resource_group",
+              "node_pool_role":  "node_pool_role",
+          }
+          missing = [k for k in need.values() if not p.get(k)]
+          if missing:
+              sys.exit("::error::pinned.auto.tfvars.json has no " + ", ".join(missing) +
+                       " -- re-run setup-pipeline.ps1 (step 12b is newer than your last run).")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              for name, key in need.items():
+                  out.write(f"{name}={p[key]}\n")
+              out.write(f"tag_name={p.get('resource_tag_name') or ''}\n")
+              out.write(f"tag_value={p.get('resource_tag_value') or ''}\n")
+          # The stages' state (scripts/run_terraform_stage.sh) and Terraform's tenant.
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              env.write(f"STATE_ACCOUNT={p['state_storage_account']}\n")
+              env.write(f"STATE_CONTAINER={p['identities_state_container']}\n")
+              env.write(f"STATE_SUBSCRIPTION={p['shared_services_subscription_id']}\n")
+              env.write(f"ARM_TENANT_ID={p['tenant_id']}\n")
+          PY
+
+      # Off our runner: workload identity federation. On it, the runners'
+      # managed identity (AZURE_CLIENT_ID, set by terraform/runners-azure).
+      - uses: azure/login@v2
+        if: ${{ vars.AZURE_CREATE_CLIENT_ID != '' }}
+        with:
+          client-id: ${{ vars.AZURE_CREATE_CLIENT_ID }}
+          tenant-id: ${{ steps.setup.outputs.tenant_id }}
+          allow-no-subscriptions: true
+
+      - name: Sign in as the runner
+        if: ${{ vars.AZURE_CREATE_CLIENT_ID == '' }}
+        run: |
+          set -euo pipefail
+          [ -n "${AZURE_CLIENT_ID:-}" ] || { echo "::error::Not on GitOps Manager's Azure runner (no AZURE_CLIENT_ID): set AZURE_CREATE_CLIENT_ID for workload identity federation."; exit 1; }
+          az login --identity --client-id "$AZURE_CLIENT_ID" --allow-no-subscriptions --output none
+          echo "Signed in as the runners' identity ($AZURE_CLIENT_ID)."
+
+      - name: Install Terraform
+        # Pinned: must match the other Terraform runs.
+        shell: bash
+        run: bash scripts/install_terraform.sh 1.17.1
+
+      - name: Tools
+        run: |
+          set -euo pipefail
+          terraform version
+          az version --query '"azure-cli"' -o tsv
+          kubectl version --client
+          helm version --short
+          python3 --version
+
+      # Traefik's address is the subnet's with the last octet 100, as the
+      # agent's; read from the subnet itself, which may be in another
+      # subscription.
+      - name: The subnet
+        id: subnet
+        env:
+          CLUSTER: ${{ inputs.cluster }}
+        run: |
+          set -euo pipefail
+          subnet=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["network"]["subnet_id"])' "clusters/$CLUSTER.json")
+          prefix=$(az network vnet subnet show --ids "$subnet" --query "addressPrefix || addressPrefixes[0]" -o tsv) ||
+            { echo "::error::Cannot read the subnet $subnet (missing, or this identity cannot read it)."; exit 1; }
+          echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
+          echo "Subnet $subnet: $prefix"
+
+      - name: Validate the cluster file
+        id: prepare
+        env:
+          CLUSTER: ${{ inputs.cluster }}
+          TENANT: ${{ steps.setup.outputs.tenant_id }}
+          SHARED_SUB: ${{ steps.setup.outputs.shared_sub }}
+          KV_NAME: ${{ steps.setup.outputs.key_vault_name }}
+          KV_RG: ${{ steps.setup.outputs.key_vault_rg }}
+          CD_REPO: ${{ vars.CD_REPO }}
+          CORE_STACK_REF: ${{ vars.CORE_STACK_REF }}
+          TAG_NAME: ${{ steps.setup.outputs.tag_name }}
+          TAG_VALUE: ${{ steps.setup.outputs.tag_value }}
+          PREFIX: ${{ steps.subnet.outputs.prefix }}
+        run: |
+          set -euo pipefail
+          for v in CD_REPO CORE_STACK_REF; do
+            [ -n "${!v:-}" ] || { echo "::error::Repository variable $v is not set (see the top of this workflow)"; exit 1; }
+          done
+          runtime=$(python3 -c 'import json, os; print(json.dumps({
+            "tenant_id": os.environ["TENANT"],
+            "shared_subscription_id": os.environ["SHARED_SUB"],
+            "key_vault_name": os.environ["KV_NAME"],
+            "key_vault_resource_group": os.environ["KV_RG"],
+            "cd_repo_url": "https://github.com/" + os.environ["CD_REPO"] + ".git",
+            "core_stack_dir": os.path.abspath("core-stack"),
+            "cost_tag_name": os.environ.get("TAG_NAME", ""),
+            "cost_tag_value": os.environ.get("TAG_VALUE", ""),
+          }))')
+          echo "RUNTIME=$runtime" >> "$GITHUB_ENV"
+          python3 scripts/create_cluster.py prepare --cluster "$CLUSTER" --runtime "$runtime" \
+            --pinned pinned.auto.tfvars.json --subnet-prefix "$PREFIX"
+
+      # The agent's create_resource_group: made if missing, tagged only when
+      # made here (a client's existing group keeps its tags). Never part of
+      # Terraform's state, so no run can ever delete it. A failed read is a
+      # failure, never "missing".
+      - name: The resource group
+        id: rg
+        env:
+          SUB: ${{ steps.prepare.outputs.subscription_id }}
+          RG: ${{ steps.prepare.outputs.resource_group }}
+          LOCATION: ${{ steps.prepare.outputs.location }}
+          ZONE_PREFIX_FILE: clusters/${{ inputs.cluster }}.json
+          TAG_NAME: ${{ steps.setup.outputs.tag_name }}
+          TAG_VALUE: ${{ steps.setup.outputs.tag_value }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if out=$(az group show --subscription "$SUB" --name "$RG" -o none 2>&1); then
+            echo "Resource group $RG exists."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          grep -q "ResourceGroupNotFound" <<<"$out" || { echo "::error::Cannot read resource group $RG: $out"; exit 1; }
+          if [ "$DRY_RUN" = true ]; then
+            echo "::notice::Resource group $RG does not exist; a real run makes it. The plan of 1-cluster needs it, so it is skipped."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          prefix=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["zone_prefix"])' "$ZONE_PREFIX_FILE")
+          tags=(AKSManager=Managed deployed_by=GitOpsManager managed_by=Terraform "environment=$prefix")
+          [ -z "$TAG_NAME" ] || tags+=("$TAG_NAME=$TAG_VALUE")
+          az group create --subscription "$SUB" --name "$RG" --location "$LOCATION" --tags "${tags[@]}" -o none
+          echo "Made resource group $RG in $LOCATION." | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "exists=true" >> "$GITHUB_OUTPUT"
+
+      # Create, then forget: the Traefik NIC leaves 1-cluster's state once made
+      # (below), because core-stack's Traefik deletes it to take its address.
+      # A cluster in the state without the NIC means it was made and forgotten:
+      # not made again.
+      - name: Forgotten Traefik NIC
+        env:
+          CLUSTER: ${{ inputs.cluster }}
+        run: |
+          set -euo pipefail
+          key="clusters/$CLUSTER/1-cluster.tfstate"
+          if az storage blob download --account-name "$STATE_ACCOUNT" --container-name "$STATE_CONTAINER" \
+               --name "$key" --file "$RUNNER_TEMP/1-cluster.tfstate" --auth-mode login --only-show-errors -o none 2>/dev/null; then
+            skip=$(python3 - <<'PY'
+          import json, os
+          state = json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "1-cluster.tfstate")))
+          types = {r.get("type") for r in state.get("resources", []) if r.get("mode") == "managed"}
+          print("true" if "azurerm_kubernetes_cluster" in types and "azurerm_network_interface" not in types else "false")
+          PY
+            )
+          else
+            skip=false
+          fi
+          echo "TF_VAR_skip_traefik_nic=$skip" >> "$GITHUB_ENV"
+          [ "$skip" = false ] || echo "The Traefik NIC was made and forgotten by an earlier run: not made again." | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Argo CD chart dependencies
+        if: ${{ !inputs.dry_run }}
+        run: helm dependency build core-stack/components/argo-cd
+
+      - name: 1-cluster
+        if: ${{ steps.rg.outputs.exists == 'true' }}
+        run: bash scripts/run_terraform_stage.sh 1-cluster "${{ inputs.cluster }}" "${{ inputs.dry_run && 'plan' || 'apply' }}" "$TFVARS"
+
+      # Forget it: out of the state, not destroyed (Terraform's "removed,
+      # destroy = false", done as state rm because the resource stays in the
+      # config for the next cluster's create).
+      - name: Forget the Traefik NIC
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          dir=terraform/create-cluster/1-cluster
+          if terraform -chdir="$dir" state list | grep -qx 'azurerm_network_interface.traefik_nic\[0\]'; then
+            terraform -chdir="$dir" state rm 'azurerm_network_interface.traefik_nic[0]'
+            echo "Forgotten (not destroyed): traefik_nic" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Nothing to forget."
+          fi
+
+      # The node pool operator's own identity, as bootstrap-cluster-identities.yml
+      # makes it: the same module, variables and state, so either carries it on.
+      # Create-if-missing: an identity of that name with no state is refused,
+      # never imported.
+      #
+      # With it, for platform_identities (core-stack components/platform-
+      # identities): Role Based Access Control Administrator on the vault and
+      # the cluster's zone, under an ABAC condition that allows only the fixed
+      # list (terraform/cluster-identities). Found here by name: the vault is
+      # setup's, the zone the cluster file's dns_zone, private or public, in
+      # the shared services or the cluster's subscription.
+      - name: ASO identity
+        id: aso
+        if: ${{ !inputs.dry_run }}
+        env:
+          CLUSTER: ${{ inputs.cluster }}
+          SHARED_SUB: ${{ steps.setup.outputs.shared_sub }}
+          IDENTITY_RG: ${{ steps.setup.outputs.identity_rg }}
+          KV_NAME: ${{ steps.setup.outputs.key_vault_name }}
+        run: |
+          set -euo pipefail
+          zone=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["dns_zone"])' "clusters/$CLUSTER.json")
+          cluster_sub=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["subscription_id"])' "clusters/$CLUSTER.json")
+          kv_id=$(az keyvault show --name "$KV_NAME" --query id -o tsv)
+          zone_ids=()
+          for sub in $(printf '%s\n' "$SHARED_SUB" "$cluster_sub" | sort -u); do
+            while IFS= read -r z; do [ -n "$z" ] && zone_ids+=("$z"); done < <(
+              az network private-dns zone list --subscription "$sub" --query "[?name=='$zone'].id" -o tsv 2>/dev/null
+              az network dns zone list --subscription "$sub" --query "[?name=='$zone'].id" -o tsv 2>/dev/null)
+          done
+          [ "${#zone_ids[@]}" -gt 0 ] || { echo "::error::No DNS zone $zone in $SHARED_SUB or $cluster_sub: external-dns's identity needs it."; exit 1; }
+          scopes=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$kv_id" "${zone_ids[@]}")
+          echo "ASO may grant the fixed list on: $scopes"
+          key="identities/$CLUSTER/aso.tfstate"
+          if [ "$(az storage blob exists --account-name "$STATE_ACCOUNT" --container-name "$STATE_CONTAINER" \
+                    --name "$key" --auth-mode login --query exists -o tsv)" != true ]; then
+            if az identity show -n "$CLUSTER-aso" -g "$IDENTITY_RG" --subscription "$SHARED_SUB" -o none 2>/dev/null; then
+              echo "::error::$CLUSTER-aso already exists in $IDENTITY_RG but was not made by Terraform (no state at $key). It is never imported or changed here."
+              exit 1
+            fi
+          fi
+          python3 scripts/create_cluster.py aso-tfvars --cluster "$CLUSTER" --runtime "$RUNTIME" \
+            --pinned pinned.auto.tfvars.json --terraform-outputs build/create-cluster/1-cluster.outputs.json \
+            --out build/create-cluster/aso.auto.tfvars.json --platform-grant-scopes "$scopes"
+          STAGE_DIR=terraform/cluster-identities STATE_KEY="$key" NO_DESTROY=1 \
+            bash scripts/run_terraform_stage.sh aso-identity "$CLUSTER" apply build/create-cluster/aso.auto.tfvars.json
+          client_id=$(python3 -c 'import json; print(json.load(open("build/create-cluster/aso-identity.outputs.json"))["client_id"]["value"])')
+          echo "client_id=$client_id" >> "$GITHUB_OUTPUT"
+
+      # Where the operator's settings read it (core-stack's
+      # azure-service-operator chart), as bootstrap-cluster-identities.yml.
+      - name: Write the ASO client ID to the vault
+        if: ${{ !inputs.dry_run }}
+        env:
+          CLUSTER: ${{ inputs.cluster }}
+          CLIENT_ID: ${{ steps.aso.outputs.client_id }}
+          KV_NAME: ${{ steps.setup.outputs.key_vault_name }}
+        run: |
+          set -euo pipefail
+          [ -n "$CLIENT_ID" ] || { echo "::error::No client ID from Terraform"; exit 1; }
+          az keyvault secret set --vault-name "$KV_NAME" --name "$CLUSTER-aso-client-id" --value "$CLIENT_ID" \
+            --tags managed_by=AKSManagerAgent deployed_by=GitOpsManager --output none ||
+            { echo "::error::Could not write $CLUSTER-aso-client-id to $KV_NAME."; exit 1; }
+
+      - name: 2-platform
+        if: ${{ !inputs.dry_run }}
+        run: bash scripts/run_terraform_stage.sh 2-platform "${{ inputs.cluster }}" apply "$TFVARS"
+
+      - name: Record the cluster
+        if: ${{ !inputs.dry_run }}
+        env:
+          CLUSTER: ${{ inputs.cluster }}
+          CLIENT_ID: ${{ steps.aso.outputs.client_id }}
+        run: |
+          set -euo pipefail
+          python3 scripts/create_cluster.py register --cluster "$CLUSTER" \
+            --terraform-outputs build/create-cluster/1-cluster.outputs.json --aso-client-id "$CLIENT_ID"
+          # identities/<cluster>.json, where the GUI reads the client IDs.
+          mkdir -p identities
+          python3 - <<'PY'
+          import json, os
+          path = f"identities/{os.environ['CLUSTER']}.json"
+          try:
+              doc = json.load(open(path))
+          except FileNotFoundError:
+              doc = {}
+          doc["aso"] = {"client_id": os.environ["CLIENT_ID"]}
+          json.dump(doc, open(path, "w"), indent=2, sort_keys=True)
+          open(path, "a").write("\n")
+          PY
+          echo "Created $CLUSTER. Next: core-stack's install-core-stack.yml with stacks/$CLUSTER.json, then the handover (system and general pools through ASO; the bootstrap pool deleted)." >> "$GITHUB_STEP_SUMMARY"
+
+      # Made here, not earlier: an App token lasts an hour.
+      - name: Token for this repo
+        id: record_app
+        if: ${{ !inputs.dry_run }}
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.GOM_APP_CLIENT_ID }}
+          private-key: ${{ secrets.GOM_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      # Through a pull request squash-merged with retries
+      # (gitopsmanager/Auto-Commit-Squash-Merge): another run's record is
+      # merged with, never overwritten. As the GitHub App.
+      - name: Commit the cluster record
+        if: ${{ !inputs.dry_run }}
+        uses: gitopsmanager/Auto-Commit-Squash-Merge@v2
+        with:
+          token: ${{ steps.record_app.outputs.token }}
+          repo_owner: ${{ github.repository_owner }}
+          repo_name: ${{ github.event.repository.name }}
+          path: .
+          repo_path_rel: clusters
+          cluster: ${{ inputs.cluster }}
+          skip_if_unchanged: "true"
+          push_auth: token
+          commit_message: "Created AKS cluster ${{ inputs.cluster }} (run ${{ github.run_id }})"
+
+      - name: Commit the ASO client ID
+        if: ${{ !inputs.dry_run }}
+        uses: gitopsmanager/Auto-Commit-Squash-Merge@v2
+        with:
+          token: ${{ steps.record_app.outputs.token }}
+          repo_owner: ${{ github.repository_owner }}
+          repo_name: ${{ github.event.repository.name }}
+          path: .
+          repo_path_rel: identities
+          cluster: ${{ inputs.cluster }}
+          skip_if_unchanged: "true"
+          push_auth: token
+          commit_message: "Cluster identity aso for ${{ inputs.cluster }} (run ${{ github.run_id }})"
+
+      # After a cancel (GitHub's Cancel button; the GUI offers none for a
+      # create): Terraform runs apart from the stage steps and has been asked to
+      # stop gracefully; this waits for it, and removes a lock this runner left
+      # only if Terraform died holding it (scripts/run_terraform_stage.sh).
+      - name: Stop Terraform gracefully
+        if: cancelled()
+        timeout-minutes: 45
+        run: bash scripts/run_terraform_stage.sh --stop

@@ -1,62 +1,14 @@
 # aksmanager-bootstrap
 
-OpenTofu bootstrap for AKS Manager — provisions Azure infrastructure, managed identities and role assignments, and the Let's Encrypt certificate pipeline.
+Terraform bootstrap for AKS Manager — provisions Azure infrastructure, managed identities and role assignments, and the Let's Encrypt certificate pipeline.
 
 The Azure counterpart of `eksmanager-bootstrap`. The identity and permissions model it implements is described in `AKSManager-Identity-Model-2026-10-04.md` (GitOps Manager internal).
 
-> **Status: early.** Only the certificate module (`tofu/lets-encrypt`) exists. The setup script, the bootstrap job, the agent's identity and role assignments, and the scheduled certificate job come next.
+> **Status: early.** Only the certificate module (`terraform/lets-encrypt`) exists. The setup script, the bootstrap job, the agent's identity and role assignments, and the scheduled certificate job come next.
 
 ---
 
-## OpenTofu, not Terraform
-
-Every module here is applied with [OpenTofu](https://opentofu.org), pinned
-(1.13.1) and checksum-verified, as in `eksmanager-bootstrap`. The certificate
-module moved from `terraform/lets-encrypt` to `tofu/lets-encrypt`; its state is
-the same blob in the same storage account, so the move changes nothing that is
-deployed. Two names date from Terraform and stay: the state container `tfstate`,
-and the `managed_by = "Terraform"` tag on the certificate secrets, which every
-guard reads as "the pipeline wrote this".
-
-The certificate job carries its script in its own environment, so after syncing
-this change into your private repo, **re-run `setup-pipeline.ps1`** before the
-job's next run. To check the move first without issuing anything, run setup
-once with `$env:PLAN_ONLY = "true"`, run the workflow, and read the plan in its
-output (no changes is the expected result); then run setup again without it.
-
-## Cluster identities: `tofu/cluster-identities`
-
-The workload identities the core stack's components run as on AKS, one per
-state (`identities/<cluster>/<identity>.tfstate`, in its own container
-`tfstate-identities`):
-
-| Identity | Service account | Role |
-|---|---|---|
-| `external-dns` | `kube-system/external-dns` | DNS Zone Contributor on the zone (Private DNS Zone Contributor for a private zone) |
-| `external-secrets` | `external-secrets/external-secrets` | Key Vault Secrets User on the vault |
-| `aso` | `azureserviceoperator-system/azureserviceoperator-default` | `AKSManagerNodePoolOperator` on the cluster and its node pools' VNets: that cluster's agent pools, nothing else |
-
-`bootstrap-cluster-identities.yml` adds one missing identity to a cluster that
-already exists; the GUI starts it when a cluster's node pools move to the CD
-repo. It is **create-if-missing**: it refuses an identity of the same name it
-did not make, never imports, changes or replaces one, and refuses a cluster
-whose OIDC issuer or workload identity is off (turning the issuer on cannot be
-undone). It records each client ID in `identities/<cluster>.json`, and for `aso`
-also writes it to Key Vault as `<cluster>-aso-client-id`, where the operator's
-settings read it. Re-running it adds that entry for an identity made before
-this step. It signs in
-as `id-aksmanager-identities` (setup step 12b), which may create identities in
-the shared services resource group and assign those four roles and no others.
-
-Workflows that record something here (`identities/<cluster>.json`) commit it through a pull
-request that is squash-merged at once (gitopsmanager/Auto-Commit-Squash-Merge),
-so two runs at the same time are merged, never overwritten. They commit it as a GitHub App, so install one on this repository with
-**Contents** and **Pull requests** read and write, then set the repository
-variable `GOM_APP_CLIENT_ID` and the secret `GOM_APP_PRIVATE_KEY`. Without them
-the run stops at its first step. With a required review on `main`, allow the App
-to bypass it, or the merge waits for a review that never comes.
-
-## Certificates: `tofu/lets-encrypt`
+## Certificates: `terraform/lets-encrypt`
 
 Issues one Let's Encrypt wildcard certificate per DNS zone (`*.<zone>`) using DNS-01 against Azure DNS, and stores each in Key Vault as `<prefix>-dns-zone-certs`. The agent reads those secrets and pushes them into clusters.
 
@@ -90,14 +42,11 @@ Copy `example-hosted-zones.json` to `hosted-zones.json` and fill it in. Each zon
       "public-dns-zone": "dev.azure.acme.com",
       "private-dns-zone": "dev.azure.acme.com",
       "subscription": "00000000-0000-0000-0000-000000000000",
-      "resource-group": "rg-dns-dev",
-      "private-resource-group": "rg-dns-dev"
+      "resource-group": "rg-dns-dev"
     }
   ]
 }
 ```
-
-`resource-group` is the **public** zone's resource group: the certificate job writes its DNS-01 challenge records there. `private-resource-group` is the **private** zone's, used only by AKS Manager for external-dns; it is optional, and when omitted the private zone is taken to be in `resource-group`. Both zones must be in the subscription given.
 
 Unlike AWS there is no per-zone `cert_manager` role to assume. Azure has no assume-role: the identity running the module holds a role assignment on each public zone directly.
 
@@ -105,7 +54,7 @@ Unlike AWS there is no per-zone `cert_manager` role to assume. Azure has no assu
 
 As with EKS Manager, AKS Manager deploys **into** your DNS; it does not create zones. For each environment you provide a public and a private zone of the same name, and you grant the certificate job's identity a role on the public zone. `example-cert-manager-role.json` defines the tightest such role, TXT records only, with the commands to create and assign it. The built-in **DNS Zone Contributor** also works if you would rather not maintain a custom role.
 
-`scripts/hosted_zones_tfvars.py` validates the file and writes `tofu/lets-encrypt/hosted-zones.auto.tfvars.json`, which OpenTofu loads automatically. It rejects missing fields, invalid subscription IDs and resource group names, duplicate zones, and two prefixes that would name the same secret.
+`scripts/hosted_zones_tfvars.py` validates the file and writes `terraform/lets-encrypt/hosted-zones.auto.tfvars.json`, which Terraform loads automatically. It rejects missing fields, invalid subscription IDs and resource group names, duplicate zones, and two prefixes that would name the same secret.
 
 ---
 
@@ -146,13 +95,13 @@ Owner does **not** grant Key Vault data access when the vault uses RBAC. You nee
 ```bash
 python3 scripts/hosted_zones_tfvars.py
 
-cd tofu/lets-encrypt
-tofu init \
+cd terraform/lets-encrypt
+terraform init \
   -backend-config="storage_account_name=<stateaccount>" \
   -backend-config="container_name=tfstate" \
   -backend-config="key=lets-encrypt.tfstate"
 
-tofu apply \
+terraform apply \
   -var="shared_services_subscription_id=$SUB" \
   -var="key_vault_id=$(az keyvault show -n <vault-name> --query id -o tsv)" \
   -var="azure_auth_method=cli"
@@ -165,27 +114,35 @@ az keyvault secret show --vault-name <vault-name> -n dev-dns-zone-certs \
   --query "{expires:attributes.expires, type:contentType}"
 ```
 
-The output `certificate_expiry` shows each certificate's expiry. The state holds the ACME account key and every certificate private key, which is why the backend uses Entra ID authentication and the storage account disallows shared keys.
+The Terraform output `certificate_expiry` shows each certificate's expiry. The state holds the ACME account key and every certificate private key, which is why the backend uses Entra ID authentication and the storage account disallows shared keys.
 
 ---
 
-## The M2M client secret: `m2m-client-secret`
+## Opt-in features (not yet tested)
 
-`setup-pipeline.ps1` (step 9a) stores the M2M client secret from the Settings
--> Terraform (Azure) block (`EKSMANAGER_CLIENT_SECRET`) in the Key Vault as
-`m2m-client-secret`. The cluster monitor's managed identity reads it to sign in
-to the GUI. The Azure agent never needed it there: it gets the secret from its
-install bundle.
+Everything above is the tested bootstrap. The features below are in this repo
+but **off unless you switch them on** when running `setup-pipeline.ps1`. Off,
+setup creates and grants exactly what it did before they existed. Switch them on
+in a demo subscription first.
 
-Always set to the Settings block's value: the M2M client lives in the GUI's
-Cognito, so that is the source of truth, and a stored value that differs is
-stale (for example after the client was rotated). It is rewritten only when it
-differs, tagged `managed_by=AKSManagerBootstrap`. Deleted but not purged: setup
-stops and says how to recover or purge it.
+| Switch (environment variable) | What it turns on | What it creates or grants in Azure |
+|---|---|---|
+| `ZONE_GRANTS=1` | The Let's Encrypt workflow grants the certificate job its DNS-01 role on a zone added to `hosted-zones.json` later, without another setup run | Role Based Access Control Administrator for `id-aksmanager-github` in each zone subscription, held by an ABAC condition to that one role for that one identity |
+| `CREATE_CLUSTER=1` (with `AKS_SUBSCRIPTIONS`) | Cluster identities and agentless create (`bootstrap-cluster-identities.yml`, `bootstrap-create-cluster.yml`, `terraform/cluster-identities`, `terraform/create-cluster/`) and the handover (`bootstrap-handover.yml`) | Identity `id-aksmanager-identities` with a federated credential, state container `tfstate-identities`, Managed Identity Contributor on the shared resource group, Reader on each AKS subscription, Role Based Access Control Administrator limited by ABAC to five roles, and three custom roles |
+| `RUNNERS=1` (with `AKS_SUBSCRIPTIONS`, `RUNNERS_ENVIRONMENT_ID`) | GitOps Manager's runners, installed by the `job-aksmanager-runners` Container Apps job (`runners.yml`, `scripts/runners-job.sh`) | Resource group `rg-aksmanager-runners`, two identities, state container `tfstate-runners`. **Review before enabling:** the runners' identity gets **Contributor on every AKS subscription**, Key Vault Secrets Officer, and Role Based Access Control Administrator limited to assigning roles that include Contributor |
+| `CLUSTER_MONITOR=1` | The cluster monitor reads the M2M client secret from the vault | Secret `m2m-client-secret` in the vault |
 
-The cluster monitor's identity needs **Key Vault Secrets User** on the vault;
-that is granted where the monitor's Container App is created, not here.
+`PLAN_ONLY=true`, set as an environment override when starting the certificate
+job (`az containerapp job start ... --env-vars PLAN_ONLY=true`), plans and
+applies nothing.
+
+Everything on Azure runs Terraform 1.17.1, pinned: the version that wrote the
+certificate state. The certificate job and the
+runners job install it themselves, and the new workflows install it on the runner
+(`scripts/install_terraform.sh`).
+
+---
 
 ## Licence
 
-[Apache License 2.0](LICENSE). See also [NOTICE](NOTICE).
+Apache License 2.0 -- see [LICENSE](LICENSE) and [NOTICE](NOTICE).

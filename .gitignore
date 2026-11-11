@@ -45,3 +45,7 @@ terraform.rc
 # Python bytecode -- regenerated on every run, never useful in a diff.
 __pycache__/
 *.pyc
+
+# The create's generated variables and outputs, and its plans
+build/
+tfplan

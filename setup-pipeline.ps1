@@ -15,9 +15,8 @@
       1. Preflight: tools, tenant, subscription, your rights, hosted-zones.json.
       2. Resource providers registered (idempotent).
       3. The shared services resource group.
-      4. OpenTofu state: storage account aksmanagertf<12 hex of subscription>,
-         container tfstate, Entra ID access only (shared keys off). (The names
-         date from Terraform and are kept: the state is the same blob.)
+      4. Terraform state: storage account aksmanagertf<12 hex of subscription>,
+         container tfstate, Entra ID access only (shared keys off).
       5. The Key Vault -- created if missing (RBAC, soft delete, purge
          protection); an existing one is used as is.
       6. The container registry, when CONTAINER_REGISTRY_NAME is set -- created
@@ -28,16 +27,11 @@
          every public zone in hosted-zones.json. You get Secrets Officer and
          blob access too, for this first run.
       8. The vault guard: a zone whose <prefix>-dns-zone-certs is a manually
-         saved certificate (not managed_by=Terraform -- the pipeline's tag
-         value, kept after the move to OpenTofu), live or soft-deleted, is
+         saved certificate (not managed_by=Terraform), live or soft-deleted, is
          left out of this run and reported. Manual certificates are never
          overwritten.
       9. The bootstrap GitHub App's credentials, read from the Key Vault
          (global-bootstrap-github-app): the org and repo the workflow runs in.
-     9a. The M2M client secret (EKSMANAGER_CLIENT_SECRET from the Settings
-         block) stored in the Key Vault as m2m-client-secret, for the cluster
-         monitor to sign in to the GUI with. Always set to the Settings
-         block's value: the GUI's M2M client is the source of truth.
      10. A Log Analytics workspace and a Container Apps environment for the job.
      11. The certificate job, job-aksmanager-letsencrypt: image
          mcr.microsoft.com/azure-cli, running scripts/lets-encrypt-job.sh as
@@ -46,15 +40,8 @@
      12. The workflow's identity, id-aksmanager-github: a federated credential
          for this repo's main branch, allowed only to start that job and read
          its logs (custom role AKSManagerJobStarter + Log Analytics Reader).
-    12b. The cluster identities workflow's identity, id-aksmanager-identities:
-         a federated credential for this repo's main branch, so
-         bootstrap-cluster-identities.yml can add a missing workload identity
-         (external-dns, external-secrets, ASO) to an AKS cluster. Its own state
-         container, and the right to assign four roles and no others. Also the
-         node pool operator's role, AKSManagerNodePoolOperator, and the right to
-         write (never read) secrets in the vault, AKSManagerVaultEntryWriter.
      13. pinned.auto.tfvars.json written to your private repo. Settings ->
-         Terraform -> Reload reads it, and so do the workflows.
+         Terraform -> Reload reads it, and so does the workflow.
 
     Certificates are not issued here. Run the "Run lets encrypt certificate
     job" workflow (.github/workflows/lets-encrypt.yml) afterwards, or wait for
@@ -89,11 +76,19 @@
     Optional overrides:
       $env:CERT_DNS_ROLE = "DNS Zone Contributor"     # default: AKSManagerCertManager, created if missing
       $env:AKSMANAGER_ALLOW_EMPTY_STATE = "true"      # see the empty-state guard
-      $env:TOFU_VERSION = "1.13.1"                    # default: the job script's pinned release
-      $env:PLAN_ONLY = "true"                         # the job plans and applies nothing; re-run
-                                                      # setup without it to go back to issuing
-      $env:AKS_SUBSCRIPTIONS = "<sub>,<sub>"          # subscriptions holding AKS clusters, when not
-                                                      # the shared services one (step 12b)
+
+    OPT-IN FEATURES -- all off unless set. Off, this script does exactly what it
+    did before these features existed. Test each in a demo subscription first.
+      $env:ZONE_GRANTS = "1"       # step 12: the Let's Encrypt workflow may give the
+                                   # certificate job its DNS-01 role on a zone added later
+      $env:CREATE_CLUSTER = "1"    # step 12b: the cluster identities / create-cluster
+                                   # identity, its custom roles and state container
+      $env:AKS_SUBSCRIPTIONS = "<id>,<id>"  # with CREATE_CLUSTER or RUNNERS: the AKS subscriptions
+      $env:RUNNERS = "1"           # step 12c: GitOps Manager's runners, their identities
+                                   # and the job that installs them (Contributor on each
+                                   # AKS subscription -- review before enabling)
+      $env:RUNNERS_ENVIRONMENT_ID = "..."  # with RUNNERS
+      $env:CLUSTER_MONITOR = "1"   # step 9a: the M2M client secret in the vault
 #>
 
 param(
@@ -192,9 +187,6 @@ $AgentVnetId       = $env:AGENT_VNET_ID
 $AgentSubnetName   = $env:AGENT_SUBNET_NAME
 $CostTagName       = $env:RESOURCE_TAG_NAME
 $CostTagValue      = $env:RESOURCE_TAG_VALUE
-# The M2M client secret, from the same Settings block (also used by the phase 2
-# bootstrap). Optional here: without it step 9a is skipped with a warning.
-$M2mClientSecret   = $env:EKSMANAGER_CLIENT_SECRET
 # Unset: our own custom role, created below if it does not exist. Set: a role
 # the customer chose (DNS Zone Contributor, or their own), used as is.
 $CertDnsRoleIsOurs = -not $env:CERT_DNS_ROLE
@@ -235,9 +227,6 @@ $StateContainer = "tfstate"
 $StateKey       = "lets-encrypt.tfstate"
 $CertIdentity   = "id-aksmanager-letsencrypt"
 $AppSecretName  = "global-bootstrap-github-app"
-# The cluster monitor reads this (its GOM_M2M_CLIENT_SECRET_NAME default on
-# Azure). Key Vault names allow no '/', so not the AWS path.
-$M2mSecretName  = "m2m-client-secret"
 $GithubRepoName = "aksmanager-bootstrap"
 
 # The certificate job and what it runs in. Fixed names, like the AWS
@@ -246,25 +235,15 @@ $GithubRepoName = "aksmanager-bootstrap"
 $LogWorkspace   = "log-aksmanager-bootstrap"
 $JobEnvironment = "cae-aksmanager-bootstrap"
 $JobName        = "job-aksmanager-letsencrypt"
-# az is needed inside the job: the azurerm backend could not use a Container
-# Apps managed identity directly (hashicorp/terraform#37268), so the job signs
-# in with az login --identity and OpenTofu uses that login.
+# az is needed inside the job: Terraform's azurerm backend cannot use a
+# Container Apps managed identity directly (hashicorp/terraform#37268), so the
+# job signs in with az login --identity and Terraform uses that login.
 $JobImage       = "mcr.microsoft.com/azure-cli:latest"
 # Weekly, Monday 03:17 UTC. Certificates renew inside 30 days of expiry, so a
 # failed week leaves three more attempts before anything lapses.
 $JobCron        = "17 3 * * 1"
 $GithubIdentity = "id-aksmanager-github"
 $JobStarterRole = "AKSManagerJobStarter"
-# bootstrap-cluster-identities.yml (step 12b): its identity, its own state
-# container -- never the certificate state's, which holds every certificate
-# private key -- and the node pool operator's role.
-$IdentitiesIdentity  = "id-aksmanager-identities"
-$IdentitiesContainer = "tfstate-identities"
-$NodePoolRole        = "AKSManagerNodePoolOperator"
-# Subscriptions holding AKS clusters. The shared services one when unset.
-$AksSubs = @(@($SubscriptionId) + @(([string]$env:AKS_SUBSCRIPTIONS) -split '[,\s]+' | Where-Object { $_ }) |
-             ForEach-Object { $_.Trim().ToLower() } | Sort-Object -Unique)
-foreach ($s in $AksSubs) { if ($s -notmatch $Guid) { Write-Error "AKS_SUBSCRIPTIONS: '$s' is not a subscription ID."; exit 1 } }
 
 # What this script creates is tagged like everything else GitOps Manager makes.
 # managed_by names the bootstrap, not the agent: the agent treats these as
@@ -272,6 +251,23 @@ foreach ($s in $AksSubs) { if ($s -notmatch $Guid) { Write-Error "AKS_SUBSCRIPTI
 $Tags = [ordered]@{ AKSManager = "Managed"; deployed_by = "GitOpsManager"; managed_by = "AKSManagerBootstrap" }
 if ($CostTagName) { $Tags[$CostTagName] = $CostTagValue }
 $TagArgs = @($Tags.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" })
+
+
+# Inputs used only by the opt-in steps (9a, 12b, 12c).
+$M2mClientSecret   = $env:EKSMANAGER_CLIENT_SECRET
+$M2mSecretName  = "m2m-client-secret"
+$IdentitiesIdentity  = "id-aksmanager-identities"
+$IdentitiesContainer = "tfstate-identities"
+$NodePoolRole        = "AKSManagerNodePoolOperator"
+$AppIdentityRole     = "AKSManagerAppIdentityOperator"
+$AksSubs = @(@($SubscriptionId) + @(([string]$env:AKS_SUBSCRIPTIONS) -split '[,\s]+' | Where-Object { $_ }) |
+             ForEach-Object { $_.Trim().ToLower() } | Sort-Object -Unique)
+foreach ($s in $AksSubs) { if ($s -notmatch $Guid) { Write-Error "AKS_SUBSCRIPTIONS: '$s' is not a subscription ID."; exit 1 } }
+# Opt-in features (see the help above). Anything but 1 or true is off.
+$zoneGrantsEnabled     = $env:ZONE_GRANTS     -in @("1", "true")
+$createClusterEnabled  = $env:CREATE_CLUSTER  -in @("1", "true")
+$runnersEnabled        = $env:RUNNERS         -in @("1", "true")
+$clusterMonitorEnabled = $env:CLUSTER_MONITOR -in @("1", "true")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -357,19 +353,7 @@ function Invoke-AzRetryAuth {
     return $r
 }
 
-# Key Vault secrets, read with PowerShell rather than az.
-#
-# az's Python carries its own list of trusted certificate authorities. Behind a
-# proxy that inspects HTTPS, the vault's certificate is re-signed by the
-# company's root -- trusted by Windows, which IT configures, but not by az -- so
-# every az keyvault call fails CERTIFICATE_VERIFY_FAILED while the ARM calls
-# above, which such proxies tend to leave alone, work (seen at a client, 15 Oct 2026).
-# Invoke-RestMethod uses the operating system's store, as the GitHub calls in
-# this script already do. az still does the signing in: only a token comes
-# from it, from Entra, which those machines reach.
-#
-# Same result shape as Invoke-Az, @{ Ok; Data; Err }, and Err carries the words
-# Test-NotFound and the role-wait retry already look for.
+# Used by the opt-in steps 9a and 12c only; the tested steps keep az.
 $script:VaultToken = $null
 function Invoke-VaultSecret {
     param([string] $Vault, [string] $Name, [switch] $Deleted)
@@ -499,7 +483,7 @@ if ($myRoles.Ok -and -not (@($myRoles.Data) | Where-Object { $_ -in @("Owner", "
 # The zone file. Read here with the same rules as scripts/hosted_zones_tfvars.py,
 # which the workflow and the job run before anything is issued -- so setup
 # needs no Python, and a file that passes one passes the other. Keyed by zone
-# name, as the job's OpenTofu module keys its certificates.
+# name, as the job's Terraform keys its certificates.
 function Read-HostedZones([string] $Path) {
     try { $doc = Get-Content $Path -Raw | ConvertFrom-Json } catch {
         Write-Error "$Path is not valid JSON: $($_.Exception.Message)"
@@ -536,10 +520,6 @@ function Read-HostedZones([string] $Path) {
         if ($sub -and $sub -notmatch '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') { $problems += "${where}: subscription '$sub' is not a subscription ID (GUID)" }
         $rg = [string]$z.'resource-group'
         if ($rg -and $rg -notmatch '^[\w\-.()]{1,90}(?<!\.)$') { $problems += "${where}: resource-group '$rg' is not a valid resource group name" }
-        # Optional: the private zone's resource group, read only by AKS Manager
-        # (external-dns). Checked here so a typo fails now, not at deploy time.
-        $privRg = [string]$z.'private-resource-group'
-        if ($privRg -and $privRg -notmatch '^[\w\-.()]{1,90}(?<!\.)$') { $problems += "${where}: private-resource-group '$privRg' is not a valid resource group name" }
         if ($name) {
             if ($resolved.Contains($name)) { $problems += "${name}: listed more than once" }
             $resolved[$name] = [pscustomobject]@{
@@ -597,9 +577,9 @@ foreach ($rg in @($SharedRg, $KeyVaultRg) + $(if ($AcrName) { @($AcrRg) } else {
     Write-Host "  + $rg created in $Location"
 }
 
-# ── 4. OpenTofu state ────────────────────────────────────────────────────────
+# ── 4. Terraform state ───────────────────────────────────────────────────────
 Write-Host ""
-Write-Host "OpenTofu state: $StateAccount / $StateContainer"
+Write-Host "Terraform state: $StateAccount / $StateContainer"
 $sa = Invoke-Az storage account show --name $StateAccount --resource-group $SharedRg
 $StatePreexisted = $sa.Ok
 if (-not $sa.Ok) {
@@ -813,7 +793,7 @@ foreach ($z in $zonesDoc.hosted_zones.PSObject.Properties.Value) {
 
 # ── 8. Vault guard ───────────────────────────────────────────────────────────
 # Manual wins where they overlap. A <prefix>-dns-zone-certs that the pipeline
-# did not write is a certificate somebody saved by hand; OpenTofu would fail
+# did not write is a certificate somebody saved by hand; Terraform would fail
 # "already exists" on it, or -- if it is soft-deleted -- recover it and write
 # over it. Such zones are left out of this run, and the rest go ahead.
 Write-Host ""
@@ -823,7 +803,7 @@ $kept = [ordered]@{}
 foreach ($p in $zonesDoc.hosted_zones.PSObject.Properties) {
     $z = $p.Value
     $secret = ($z.dns_zone_prefix -replace '_', '-') + "-dns-zone-certs"
-    $live = Invoke-VaultSecretRetryAuth -Vault $KeyVaultName -Name $secret
+    $live = Invoke-AzRetryAuth keyvault secret show --vault-name $KeyVaultName --name $secret --query "{tags:tags}"
     if ($live.Ok) {
         $owner = Get-ManagedBy $live.Data.tags
         if ($owner -ne "Terraform") {
@@ -831,17 +811,14 @@ foreach ($p in $zonesDoc.hosted_zones.PSObject.Properties) {
             continue
         }
     } elseif (Test-NotFound $live.Err) {
-        $gone = Invoke-VaultSecretRetryAuth -Vault $KeyVaultName -Name $secret -Deleted
+        $gone = Invoke-AzRetryAuth keyvault secret show-deleted --vault-name $KeyVaultName --name $secret --query "{tags:tags}"
         if ($gone.Ok -and (Get-ManagedBy $gone.Data.tags) -ne "Terraform") {
             $blocked += "$($z.public_dns_zone): $secret was deleted but not purged, and is not the pipeline's. Purge it (az keyvault secret purge --vault-name $KeyVaultName --name $secret) or choose a different prefix."
             continue
         }
     } else {
-        # A warning, not a stop: nothing in setup acts on the guard's answer --
-        # it only reports -- and the job runs the same guard, from inside Azure,
-        # before OpenTofu writes anything. So an unreadable secret here loses
-        # an early warning, not a protection.
-        Write-Warning "Could not check $secret in $KeyVaultName, so it is not known whether a manual certificate is there. The job checks again before issuing.`n$($live.Err)"
+        Write-Error "Could not read $secret in $KeyVaultName`n$($live.Err)"
+        exit 1
     }
     $kept[$p.Name] = $z
     Write-Host "  ok $($z.dns_zone_prefix) -> $secret"
@@ -858,13 +835,12 @@ if ($kept.Count -eq 0) {
 # the workflow's federated credential, and one token writes the pinned file.
 Write-Host ""
 Write-Host "GitHub App: $AppSecretName"
-$app = Invoke-VaultSecretRetryAuth -Vault $KeyVaultName -Name $AppSecretName
+$app = Invoke-AzRetryAuth keyvault secret show --vault-name $KeyVaultName --name $AppSecretName --query value
 if (-not $app.Ok) {
-    $hint = if (Test-NotFound $app.Err) { "install the AKS Manager bootstrap GitHub App from Settings first" } else { "see the error below" }
-    Write-Error "Could not read $AppSecretName from $KeyVaultName -- $hint.`n$($app.Err)"
+    Write-Error "Could not read $AppSecretName from $KeyVaultName -- install the AKS Manager bootstrap GitHub App from Settings first.`n$($app.Err)"
     exit 1
 }
-$appCreds  = ([string]$app.Data.value) | ConvertFrom-Json
+$appCreds  = ([string]$app.Data) | ConvertFrom-Json
 $GithubOrg = $appCreds.githubOrg
 $GithubInstallId = $appCreds.installId
 # Immutable IDs: GitHub's OIDC sub claim names them for repos created after
@@ -898,6 +874,8 @@ Remove-Variable appJwt -ErrorAction SilentlyContinue
 if (-not $installToken) { Write-Error "Could not get a GitHub App installation token."; exit 1 }
 
 # ── 9a. The M2M client secret ────────────────────────────────────────────────
+# Opt-in: CLUSTER_MONITOR=1.
+if ($clusterMonitorEnabled) {
 # The cluster monitor (the agentless replacement for the agent's cache) signs
 # in to the GUI with the M2M client. The Azure agent never needed this: it gets
 # the secret from its install bundle. The monitor has no bundle, so the secret
@@ -931,6 +909,7 @@ if ([string]::IsNullOrWhiteSpace($M2mClientSecret)) {
         Write-Error "Could not read $M2mSecretName from $KeyVaultName.`n$($m2m.Err)"
         exit 1
     }
+}
 }
 
 # ── 10. Container Apps environment ───────────────────────────────────────────
@@ -992,12 +971,10 @@ $jobEnv = [ordered]@{
     STATE_ACCOUNT        = $StateAccount
     STATE_CONTAINER      = $StateContainer
     STATE_KEY            = $StateKey
-    # Empty: the job script's pinned OpenTofu release. Set TOFU_VERSION before
-    # running setup to use another.
-    TOFU_VERSION         = [string]$env:TOFU_VERSION
-    # "true": the job plans and applies nothing (scripts/lets-encrypt-job.sh).
-    # Anything else, or unset: it issues and renews as usual.
-    PLAN_ONLY            = [string]$env:PLAN_ONLY
+    # Empty: the job script's pinned release (1.17.1, the version that wrote the
+    # certificate state). Set
+    # TERRAFORM_VERSION before running setup only to move it deliberately.
+    TERRAFORM_VERSION    = [string]$env:TERRAFORM_VERSION
     JOB_SCRIPT_B64       = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($jobScript))
 }
 $jobSpec = [ordered]@{
@@ -1026,43 +1003,27 @@ $jobSpec = [ordered]@{
         }
     }
 }
-# Sent to ARM as is, with az rest -- NOT az containerapp job create/update
-# --yaml. The --yaml path converts the spec's keys between snake_case and
-# camelCase, and that conversion also runs over the KEY of
-# userAssignedIdentities, which is the identity's resource ID. Any underscore
-# in it is eaten and everything after title-cased: resource group CLIENT_WEU
-# came out CLIENTWeu, and the create failed "...Userassignedidentities/
-# Id-Aksmanager-Letsencrypt was not found" (seen at a client, 15 Oct 2026). The spec above
-# is already the ARM resource shape, so a PUT needs no conversion at all -- and
-# PUT is create-or-update, so one call covers both.
-$show = Invoke-Az containerapp job show --resource-group $SharedRg --name $JobName
-if (-not $show.Ok -and -not (Test-NotFound $show.Err)) { Write-Error "Could not read job $JobName`n$($show.Err)"; exit 1 }
-$jobExisted = $show.Ok
-$jobUri = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$SharedRg/providers/Microsoft.App/jobs/${JobName}?api-version=2024-03-01"
-$jobSpecFile = Join-Path ([IO.Path]::GetTempPath()) "aksmanager-job-$([guid]::NewGuid().ToString('N')).json"
+# JSON is valid YAML, which is what --yaml reads.
+$jobSpecFile = Join-Path ([IO.Path]::GetTempPath()) "aksmanager-job-$([guid]::NewGuid().ToString('N')).yaml"
 try {
     ($jobSpec | ConvertTo-Json -Depth 12) | Set-Content $jobSpecFile -Encoding utf8
-    Assert-Az "$(if ($jobExisted) { 'Updating' } else { 'Creating' }) job $JobName" `
-        (Invoke-Az rest --method put --uri $jobUri --body "@$jobSpecFile" --headers "Content-Type=application/json") | Out-Null
+    $job = Invoke-Az containerapp job show --resource-group $SharedRg --name $JobName
+    if ($job.Ok) {
+        Assert-Az "Updating job $JobName" `
+            (Invoke-Az containerapp job update --resource-group $SharedRg --name $JobName --yaml $jobSpecFile) | Out-Null
+        Write-Host "  ~ updated (image $JobImage, schedule '$JobCron' UTC)"
+    } elseif (Test-NotFound $job.Err) {
+        Assert-Az "Creating job $JobName" `
+            (Invoke-Az containerapp job create --resource-group $SharedRg --name $JobName --yaml $jobSpecFile) | Out-Null
+        Write-Host "  + created (image $JobImage, schedule '$JobCron' UTC)"
+    } else {
+        Write-Error "Could not read job $JobName`n$($job.Err)"; exit 1
+    }
 } finally {
     Remove-Item $jobSpecFile -ErrorAction SilentlyContinue
 }
-
-# The PUT returns once ARM accepts it; provisioning -- attaching the identity
-# among it -- finishes afterwards. Wait for the outcome here, so a failure is
-# reported against this step rather than surfacing later as a missing job.
-$jobState = ""
-for ($i = 1; $i -le 40; $i++) {
-    $job = Invoke-Az containerapp job show --resource-group $SharedRg --name $JobName
-    $jobState = if ($job.Ok) { [string]$job.Data.properties.provisioningState } else { "" }
-    if ($jobState -in @("Succeeded", "Failed", "Canceled")) { break }
-    Start-Sleep -Seconds 6
-}
-if ($jobState -ne "Succeeded") {
-    Write-Error "Job $JobName did not finish provisioning (state '$jobState'). The reason is in the activity log of $SharedRg.`n$($job.Err)"
-    exit 1
-}
-Write-Host "  $(if ($jobExisted) { '~ updated' } else { '+ created' }) (image $JobImage, schedule '$JobCron' UTC)"
+$job = Invoke-Az containerapp job show --resource-group $SharedRg --name $JobName
+Assert-Az "Reading job $JobName" $job | Out-Null
 $JobId = $job.Data.id
 
 # ── 12. The workflow's identity ──────────────────────────────────────────────
@@ -1131,6 +1092,8 @@ if (-not $starterDef) {
 Grant-Role $gi.Data.principalId "ServicePrincipal" $JobStarterRole $JobId "$GithubIdentity on $JobName"
 Grant-Role $gi.Data.principalId "ServicePrincipal" "Log Analytics Reader" $WorkspaceId "$GithubIdentity on $LogWorkspace"
 
+# Opt-in: ZONE_GRANTS=1.
+if ($zoneGrantsEnabled) {
 # Let the workflow give the job its DNS-01 role on a zone added later, so a new
 # zone in hosted-zones.json needs a workflow run rather than another setup run.
 #
@@ -1177,10 +1140,13 @@ foreach ($sub in $zoneSubs) {
             --description "GitOps Manager: the Let's Encrypt workflow may grant $CertDnsRole to $CertIdentity, and nothing else") | Out-Null
     Write-Host "  + $GithubIdentity may grant $CertDnsRole to $CertIdentity in $scope (nothing else)"
 }
+}
 
 # ── 12b. The cluster identities workflow's identity ─────────────────────────
+# Opt-in: CREATE_CLUSTER=1.
+if ($createClusterEnabled) {
 # bootstrap-cluster-identities.yml adds ONE missing workload identity to an
-# AKS cluster (tofu/cluster-identities): a managed identity in $SharedRg, its
+# AKS cluster (terraform/cluster-identities): a managed identity in $SharedRg, its
 # federated credential, and its roles. This is the identity that run signs in
 # as, from this repo's main branch only. What it may do:
 #   - create managed identities and federated credentials in $SharedRg
@@ -1296,7 +1262,48 @@ try {
     Remove-Item $tmp -ErrorAction SilentlyContinue
 }
 
-# The four roles it may assign, by definition GUID, looked up rather than
+# REVIEW (9 Nov 2026, not run): the workload identity operator's role
+# (components/azure-service-operator, core-stack tools/cd_identities.py):
+# managed identities and their federated credentials, and nothing else -- no
+# role assignments, so an identity it makes has no access until someone grants
+# it. Created when missing, assignable in the AKS subscriptions; an existing
+# definition is never changed.
+$aiDef = Get-RoleDefinition $AppIdentityRole $aksScopes[0]
+if (-not $aiDef) {
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) "aksmanager-appidentity-role-$([guid]::NewGuid().ToString('N')).json"
+    try {
+        ([ordered]@{
+            Name             = $AppIdentityRole
+            IsCustom         = $true
+            Description      = "GitOps Manager: workload identities from the CD repo -- managed identities and their federated credentials, through Azure Service Operator. No role assignments."
+            Actions          = @(
+                "Microsoft.ManagedIdentity/userAssignedIdentities/read",
+                "Microsoft.ManagedIdentity/userAssignedIdentities/write",
+                "Microsoft.ManagedIdentity/userAssignedIdentities/delete",
+                "Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials/read",
+                "Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials/write",
+                "Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials/delete",
+                "Microsoft.Resources/subscriptions/resourceGroups/read")
+            NotActions       = @()
+            DataActions      = @()
+            NotDataActions   = @()
+            AssignableScopes = $aksScopes
+        } | ConvertTo-Json -Depth 4) | Set-Content $tmp -Encoding utf8
+        Assert-Az "Creating role $AppIdentityRole" (Invoke-Az role definition create --role-definition "@$tmp") | Out-Null
+        Write-Host "  + role $AppIdentityRole created, assignable in $($aksScopes -join ', ')"
+        for ($i = 1; $i -le 12 -and -not $aiDef; $i++) {
+            Start-Sleep -Seconds 10
+            $aiDef = Get-RoleDefinition $AppIdentityRole $aksScopes[0]
+        }
+        if (-not $aiDef) { Write-Error "Role $AppIdentityRole was created but is not visible yet. Run this script again in a few minutes."; exit 1 }
+    } finally {
+        Remove-Item $tmp -ErrorAction SilentlyContinue
+    }
+} else {
+    Write-Host "  = role $AppIdentityRole exists"
+}
+
+# The five roles it may assign, by definition GUID, looked up rather than
 # written in.
 $assignable = @()
 foreach ($r in @("Key Vault Secrets User", "DNS Zone Contributor", "Private DNS Zone Contributor")) {
@@ -1305,6 +1312,7 @@ foreach ($r in @("Key Vault Secrets User", "DNS Zone Contributor", "Private DNS 
     $assignable += [string]$d.name
 }
 $assignable += [string]$npDef.name
+$assignable += [string]$aiDef.name
 $guidList = ($assignable | ForEach-Object { $_ }) -join ', '
 $idCondition = "((!(ActionMatches{'Microsoft.Authorization/roleAssignments/write'})) OR " +
     "(@Request[Microsoft.Authorization/roleAssignments:RoleDefinitionId] ForAnyOfAnyValues:GuidEquals {$guidList} AND " +
@@ -1361,6 +1369,258 @@ if (-not $writerDef) {
     }
 }
 Grant-Role $IdentitiesPrincipalId "ServicePrincipal" $VaultWriterRole $KeyVaultId $IdentitiesIdentity
+}
+
+# ── 12c. GitOps Manager's runners: their identity, and the job that installs them
+# Opt-in: RUNNERS=1.
+if ($runnersEnabled) {
+# The runners (core-stack's terraform/runners-azure, synced here as runners/) are
+# applied by the runners job, job-aksmanager-runners, started from the
+# "Install GitOps Manager runners" workflow (.github/workflows/runners.yml):
+# the Azure counterpart of the runner step in eksmanager-bootstrap's pipeline.
+# Modelled on AWS, where that pipeline creates nothing that grants: the
+# runners run as an identity this script makes and grants once, here, as the
+# AWS runners run as the agent role; the job only builds the runners' apps and
+# attaches that identity. Two identities:
+#
+#   $RunnersIdentity (the runners) -- what terraform/create-cluster/README.md lists
+#     for the runner's identity, and what the ad-hoc commands need:
+#       - Contributor on each AKS subscription (the resource group, the
+#         cluster, its identities, the NIC, joining the node subnet)
+#       - Role Based Access Control Administrator there, in each subscription
+#         with a public zone, and in shared services, under an ABAC condition:
+#         assign Contributor, Network Contributor, Managed Identity Operator,
+#         AcrPull and the cluster identities' roles (step 12b), to service
+#         principals, and nothing else
+#       - Managed Identity Contributor on $SharedRg (the cluster identities)
+#       - Key Vault Secrets Officer on the vault (secret-write.yml and
+#         secret-delete.yml run as it; the create's admin password)
+#       - AcrPull on the registry (the runner image)
+#       - Storage Blob Data Contributor on $IdentitiesContainer (the create's
+#         stages)
+#   $RunnersJobIdentity (the job) -- no role assignments of any kind:
+#       - Container Apps Contributor on $RunnersRg, where the runners' apps
+#         and jobs go (not $SharedRg: the job cannot change its own job or the
+#         certificate job)
+#       - Container Apps Contributor on the cluster monitor's environment
+#         (RUNNERS_ENVIRONMENT_ID), to place the runners in it
+#       - Managed Identity Operator on $RunnersIdentity, to attach it
+#       - Reader on the vault and the registry (Terraform looks them up)
+#       - Key Vault Secrets User on two secrets: the bootstrap App's (to clone
+#         this repo and read its variables) and the organisation's GitHub App
+#         secret (global-arc-global-arc-runner-<org>)
+#       - $VaultWriterRole (write, never read) on one secret, <that>-key, the
+#         copy of the App's key the scaler (KEDA) reads; created here empty so
+#         it can be granted on
+#       - Storage Blob Data Contributor on its own state container,
+#         $RunnersContainer
+# The organisation's App secret exists once the GitHub App is installed from
+# Settings; until then the job is made but cannot read it, and says so: re-run
+# this script after installing the App.
+$RunnersRg            = "rg-aksmanager-runners"
+$RunnersIdentity      = "id-aksmanager-runners"
+$RunnersJobIdentity   = "id-aksmanager-runners-job"
+$RunnersJobName       = "job-aksmanager-runners"
+$RunnersContainer     = "tfstate-runners"
+$RunnersEnvironmentId = ([string]$env:RUNNERS_ENVIRONMENT_ID).Trim()
+$ArcSecretName        = "global-arc-global-arc-runner-$($GithubOrg.ToLower())"
+$ArcKeySecretName     = "$ArcSecretName-key"
+
+Write-Host ""
+Write-Host "GitOps Manager runners: $RunnersRg, $RunnersIdentity, $RunnersJobName"
+$g = Invoke-Az group show --name $RunnersRg
+if ($g.Ok) {
+    Write-Host "  = $RunnersRg"
+    Add-TagsIfUnowned $g.Data.id $g.Data.tags
+} else {
+    if (-not (Test-NotFound $g.Err)) { Write-Error "Could not read resource group $RunnersRg`n$($g.Err)"; exit 1 }
+    $c = Assert-Az "Creating resource group $RunnersRg" (Invoke-Az group create --name $RunnersRg --location $Location)
+    Add-TagsIfUnowned $c.id $null
+    Write-Host "  + $RunnersRg created in $Location"
+}
+$RunnersRgId = "/subscriptions/$SubscriptionId/resourceGroups/$RunnersRg"
+
+$identities = @{}
+foreach ($name in @($RunnersIdentity, $RunnersJobIdentity)) {
+    $x = Invoke-Az identity show --name $name --resource-group $RunnersRg
+    if (-not $x.Ok) {
+        if (-not (Test-NotFound $x.Err)) { Write-Error "Could not read identity $name`n$($x.Err)"; exit 1 }
+        $x = Invoke-Az identity create --name $name --resource-group $RunnersRg --location $Location --tags @TagArgs
+        Assert-Az "Creating identity $name" $x | Out-Null
+        Write-Host "  + $name created"
+    } else {
+        Write-Host "  = $name exists"
+    }
+    $identities[$name] = $x.Data
+}
+$RunnersPrincipalId = $identities[$RunnersIdentity].principalId
+$RunnersJobPrincipalId = $identities[$RunnersJobIdentity].principalId
+
+# The runners' identity.
+foreach ($sub in $AksSubs) {
+    Grant-Role $RunnersPrincipalId "ServicePrincipal" "Contributor" "/subscriptions/$sub" "$RunnersIdentity on /subscriptions/$sub"
+}
+Grant-Role $RunnersPrincipalId "ServicePrincipal" "Managed Identity Contributor" "/subscriptions/$SubscriptionId/resourceGroups/$SharedRg" "$RunnersIdentity on $SharedRg"
+Grant-Role $RunnersPrincipalId "ServicePrincipal" "Key Vault Secrets Officer" $KeyVaultId "$RunnersIdentity on $KeyVaultName"
+Grant-Role $RunnersPrincipalId "ServicePrincipal" "Storage Blob Data Contributor" `
+    "$StateAccountId/blobServices/default/containers/$IdentitiesContainer" "$RunnersIdentity on $IdentitiesContainer"
+$AcrId = ""
+if ($AcrName) {
+    $AcrId = (Assert-Az "Reading $AcrName" (Invoke-Az acr show --name $AcrName --resource-group $AcrRg)).id
+    Grant-Role $RunnersPrincipalId "ServicePrincipal" "AcrPull" $AcrId "$RunnersIdentity on $AcrName"
+}
+
+$runnerAssignable = @($assignable)
+foreach ($r in @("Contributor", "Network Contributor", "Managed Identity Operator", "AcrPull")) {
+    $d = Get-RoleDefinition $r "/subscriptions/$SubscriptionId"
+    if (-not $d) { Write-Error "Could not find the built-in role '$r'."; exit 1 }
+    $runnerAssignable += [string]$d.name
+}
+$runnerGuids = ($runnerAssignable | Sort-Object -Unique) -join ', '
+$runnerCondition = "((!(ActionMatches{'Microsoft.Authorization/roleAssignments/write'})) OR " +
+    "(@Request[Microsoft.Authorization/roleAssignments:RoleDefinitionId] ForAnyOfAnyValues:GuidEquals {$runnerGuids} AND " +
+    "@Request[Microsoft.Authorization/roleAssignments:PrincipalType] StringEqualsIgnoreCase 'ServicePrincipal')) AND " +
+    "((!(ActionMatches{'Microsoft.Authorization/roleAssignments/delete'})) OR " +
+    "(@Resource[Microsoft.Authorization/roleAssignments:RoleDefinitionId] ForAnyOfAnyValues:GuidEquals {$runnerGuids}))"
+foreach ($sub in $idSubs) {
+    $scope = "/subscriptions/$sub"
+    $existing = Invoke-Az role assignment list --assignee-object-id $RunnersPrincipalId --role $RbacAdminRole --scope $scope
+    $atScope = @(@($existing.Data) | Where-Object { $_ -and $_.scope -eq $scope })
+    if (@($atScope | Where-Object { (& $normalise $_.condition) -eq (& $normalise $runnerCondition) }).Count -gt 0) {
+        Write-Host "  = $RunnersIdentity may assign the runners' roles in $scope"
+        continue
+    }
+    foreach ($old in $atScope) {
+        Assert-Az "Removing an outdated $RbacAdminRole assignment for $RunnersIdentity in $scope" `
+            (Invoke-Az role assignment delete --ids $old.id) | Out-Null
+    }
+    Assert-Az "Letting $RunnersIdentity assign the runners' roles in $scope" `
+        (Invoke-Az role assignment create --assignee-object-id $RunnersPrincipalId --assignee-principal-type ServicePrincipal `
+            --role $RbacAdminRole --scope $scope --condition $runnerCondition --condition-version "2.0" `
+            --description "GitOps Manager: the runners may assign Contributor, Network Contributor, Managed Identity Operator, AcrPull and the cluster identities' roles to service principals, and nothing else") | Out-Null
+    Write-Host "  + $RunnersIdentity may assign the runners' roles in $scope (nothing else)"
+}
+
+# The job's identity: no role assignments, no secret values but two.
+Grant-Role $RunnersJobPrincipalId "ServicePrincipal" "Container Apps Contributor" $RunnersRgId "$RunnersJobIdentity on $RunnersRg"
+Grant-Role $RunnersJobPrincipalId "ServicePrincipal" "Managed Identity Operator" $identities[$RunnersIdentity].id "$RunnersJobIdentity on $RunnersIdentity"
+Grant-Role $RunnersJobPrincipalId "ServicePrincipal" "Reader" $KeyVaultId "$RunnersJobIdentity on $KeyVaultName"
+if ($AcrId) { Grant-Role $RunnersJobPrincipalId "ServicePrincipal" "Reader" $AcrId "$RunnersJobIdentity on $AcrName" }
+Grant-Role $RunnersJobPrincipalId "ServicePrincipal" "Key Vault Secrets User" "$KeyVaultId/secrets/$AppSecretName" "$RunnersJobIdentity on $AppSecretName"
+if ($RunnersEnvironmentId) {
+    Grant-Role $RunnersJobPrincipalId "ServicePrincipal" "Container Apps Contributor" $RunnersEnvironmentId "$RunnersJobIdentity on the runners' environment"
+} else {
+    Write-Warning "RUNNERS_ENVIRONMENT_ID is not set (the cluster monitor's Container Apps environment, terraform/cluster-monitor-azure's output container_app_environment_id). The runners job will not apply until it is: set it and run this script again."
+}
+
+$exists = Invoke-AzRetryAuth storage container exists --name $RunnersContainer --account-name $StateAccount --auth-mode login
+if (-not ($exists.Ok -and $exists.Data.exists)) {
+    Assert-Az "Creating container $RunnersContainer" (Invoke-AzRetryAuth storage container create --name $RunnersContainer `
+        --account-name $StateAccount --auth-mode login) | Out-Null
+    Write-Host "  + container $RunnersContainer created"
+} else {
+    Write-Host "  = container $RunnersContainer exists"
+}
+Grant-Role $RunnersJobPrincipalId "ServicePrincipal" "Storage Blob Data Contributor" `
+    "$StateAccountId/blobServices/default/containers/$RunnersContainer" "$RunnersJobIdentity on $RunnersContainer"
+
+# The organisation's App secret and the key's copy, granted on each secret.
+$arc = Invoke-VaultSecretRetryAuth -Vault $KeyVaultName -Name $ArcSecretName
+if ($arc.Ok) {
+    Grant-Role $RunnersJobPrincipalId "ServicePrincipal" "Key Vault Secrets User" "$KeyVaultId/secrets/$ArcSecretName" "$RunnersJobIdentity on $ArcSecretName"
+    $key = Invoke-VaultSecretRetryAuth -Vault $KeyVaultName -Name $ArcKeySecretName
+    if (-not $key.Ok) {
+        if ($key.Err -notmatch 'SecretNotFound') { Write-Error "Could not read $ArcKeySecretName`n$($key.Err)"; exit 1 }
+        Assert-Az "Creating $ArcKeySecretName (empty until the runners job writes it)" `
+            (Set-VaultSecret -Vault $KeyVaultName -Name $ArcKeySecretName -Value "pending: written by $RunnersJobName" -ContentType "text/plain") | Out-Null
+        Write-Host "  + $ArcKeySecretName created, empty until the runners job writes it"
+    }
+    Grant-Role $RunnersJobPrincipalId "ServicePrincipal" $VaultWriterRole "$KeyVaultId/secrets/$ArcKeySecretName" "$RunnersJobIdentity on $ArcKeySecretName"
+} elseif ($arc.Err -match 'SecretNotFound') {
+    Write-Warning "$ArcSecretName is not in $KeyVaultName yet: install the ARC GitHub App from Settings, then run this script again so the runners job may read it."
+} else {
+    Write-Error "Could not read $ArcSecretName`n$($arc.Err)"; exit 1
+}
+
+# The job, beside the certificate job in $SharedRg (out of the job identity's
+# reach), started by hand only: the workflow, or az containerapp job start.
+$runnersScriptPath = Join-Path $RepoRoot "scripts/runners-job.sh"
+if (-not (Test-Path $runnersScriptPath)) { Write-Error "scripts/runners-job.sh not found in $RepoRoot -- Sync the repo from Settings."; exit 1 }
+$runnersScript = (Get-Content $runnersScriptPath -Raw) -replace "`r`n", "`n"
+$runnersEnv = [ordered]@{
+    AZURE_CLIENT_ID      = $identities[$RunnersJobIdentity].clientId
+    TENANT_ID            = $TenantId
+    SUBSCRIPTION_ID      = $SubscriptionId
+    KEY_VAULT_NAME       = $KeyVaultName
+    APP_SECRET_NAME      = $AppSecretName
+    GITHUB_REPO_NAME     = $GithubRepoName
+    STATE_RESOURCE_GROUP = $SharedRg
+    STATE_ACCOUNT        = $StateAccount
+    STATE_CONTAINER      = $RunnersContainer
+    STATE_KEY            = "runners.tfstate"
+    # SaaS: the runners sign in to the GUI with these (the Settings block).
+    M2M_CLIENT_ID        = [string]$env:EKSMANAGER_CLIENT_ID
+    M2M_COGNITO_URL      = [string]$env:EKSMANAGER_COGNITO_URL
+    SERVER_URL           = [string]$env:EKSMANAGER_API_URL
+    # Pinned, like the AWS builds: the runners' state is new.
+    TERRAFORM_VERSION    = "1.17.1"
+    PLAN_ONLY            = [string]$env:PLAN_ONLY
+    JOB_SCRIPT_B64       = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($runnersScript))
+}
+$runnersSpec = [ordered]@{
+    location   = $Location
+    tags       = $Tags
+    identity   = @{ type = "UserAssigned"; userAssignedIdentities = @{ ($identities[$RunnersJobIdentity].id) = @{} } }
+    properties = [ordered]@{
+        environmentId = $EnvironmentId
+        configuration = [ordered]@{
+            triggerType         = "Manual"
+            replicaTimeout      = 2700
+            replicaRetryLimit   = 0
+            manualTriggerConfig = [ordered]@{ parallelism = 1; replicaCompletionCount = 1 }
+        }
+        template = @{
+            containers = @(
+                [ordered]@{
+                    name      = "runners"
+                    image     = $JobImage
+                    command   = @("/bin/bash", "-c")
+                    args      = @('echo "$JOB_SCRIPT_B64" | base64 -d > /tmp/runners-job.sh && exec bash /tmp/runners-job.sh')
+                    env       = @($runnersEnv.GetEnumerator() | ForEach-Object { [ordered]@{ name = $_.Key; value = [string]$_.Value } })
+                    resources = [ordered]@{ cpu = 0.5; memory = "1Gi" }
+                }
+            )
+        }
+    }
+}
+# az rest PUT, as the certificate job (step 11 says why).
+$show = Invoke-Az containerapp job show --resource-group $SharedRg --name $RunnersJobName
+if (-not $show.Ok -and -not (Test-NotFound $show.Err)) { Write-Error "Could not read job $RunnersJobName`n$($show.Err)"; exit 1 }
+$runnersExisted = $show.Ok
+$runnersUri = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$SharedRg/providers/Microsoft.App/jobs/${RunnersJobName}?api-version=2024-03-01"
+$runnersSpecFile = Join-Path ([IO.Path]::GetTempPath()) "aksmanager-runners-job-$([guid]::NewGuid().ToString('N')).json"
+try {
+    ($runnersSpec | ConvertTo-Json -Depth 12) | Set-Content $runnersSpecFile -Encoding utf8
+    Assert-Az "$(if ($runnersExisted) { 'Updating' } else { 'Creating' }) job $RunnersJobName" `
+        (Invoke-Az rest --method put --uri $runnersUri --body "@$runnersSpecFile" --headers "Content-Type=application/json") | Out-Null
+} finally {
+    Remove-Item $runnersSpecFile -ErrorAction SilentlyContinue
+}
+$runnersState = ""
+for ($i = 1; $i -le 40; $i++) {
+    $rj = Invoke-Az containerapp job show --resource-group $SharedRg --name $RunnersJobName
+    $runnersState = if ($rj.Ok) { [string]$rj.Data.properties.provisioningState } else { "" }
+    if ($runnersState -in @("Succeeded", "Failed", "Canceled")) { break }
+    Start-Sleep -Seconds 6
+}
+if ($runnersState -ne "Succeeded") {
+    Write-Error "Job $RunnersJobName did not finish provisioning (state '$runnersState'). The reason is in the activity log of $SharedRg.`n$($rj.Err)"
+    exit 1
+}
+Write-Host "  $(if ($runnersExisted) { '~ updated' } else { '+ created' }) job $RunnersJobName (started by hand only)"
+# The workflow's identity may start it, as it may the certificate job.
+Grant-Role $gi.Data.principalId "ServicePrincipal" $JobStarterRole $rj.Data.id "$GithubIdentity on $RunnersJobName"
+}
 
 # ── 13. pinned.auto.tfvars.json in the private repo ──────────────────────────
 # Settings -> Terraform -> Reload reads it, and the workflow takes the job,
@@ -1383,18 +1643,32 @@ $pinned = [ordered]@{
     resource_tag_value                  = $CostTagValue
     state_storage_account               = $StateAccount
     cert_identity_client_id             = $id.Data.clientId
-    # For the workflow's grant step: whom to give the DNS-01 role, and which.
-    cert_identity_principal_id          = $CertPrincipalId
-    cert_dns_role                       = $CertDnsRole
     lets_encrypt_job_name               = $JobName
     container_apps_environment          = $JobEnvironment
     log_analytics_workspace_customer_id = $WorkspaceCustomerId
     github_identity_client_id           = $gi.Data.clientId
+}
+# Opt-in keys: written only for the features switched on.
+if ($zoneGrantsEnabled) {
+    # For the workflow's grant step: whom to give the DNS-01 role, and which.
+    $pinned.cert_identity_principal_id = $CertPrincipalId
+    $pinned.cert_dns_role              = $CertDnsRole
+}
+if ($createClusterEnabled) {
     # bootstrap-cluster-identities.yml (step 12b).
-    identities_identity_client_id       = $ii.Data.clientId
-    identities_resource_group           = $SharedRg
-    identities_state_container          = $IdentitiesContainer
-    node_pool_role                      = $NodePoolRole
+    $pinned.identities_identity_client_id = $ii.Data.clientId
+    $pinned.identities_resource_group     = $SharedRg
+    $pinned.identities_state_container    = $IdentitiesContainer
+    $pinned.node_pool_role                = $NodePoolRole
+    $pinned.app_identity_role             = $AppIdentityRole
+}
+if ($runnersEnabled) {
+    # The runners job (step 12c) and what scripts/runners-job.sh applies with.
+    $pinned.runners_job_name           = $RunnersJobName
+    $pinned.runners_resource_group     = $RunnersRg
+    $pinned.runners_identity_name      = $RunnersIdentity
+    $pinned.runners_identity_client_id = $identities[$RunnersIdentity].clientId
+    $pinned.runners_environment_id     = $RunnersEnvironmentId
 }
 $pinnedJson = $pinned | ConvertTo-Json
 $headers = @{ Authorization = "Bearer $installToken"; Accept = "application/vnd.github+json" }
@@ -1440,3 +1714,6 @@ Write-Host ""
 Write-Host "Check a certificate afterwards:"
 Write-Host "  az keyvault secret show --vault-name $KeyVaultName -n <prefix>-dns-zone-certs --query `"{expires:attributes.expires, tags:tags}`""
 Write-Host "================================================================"
+if ($runnersEnabled) {
+    Write-Host "  Runners:    $RunnersJobName (Actions -> 'Install GitOps Manager runners'), as $RunnersIdentity"
+}

@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 GitOps Manager, S.L.
 # SPDX-License-Identifier: Apache-2.0
-"""Validate hosted-zones.json and write it as OpenTofu variables.
+"""Validate hosted-zones.json and write it as Terraform variables.
 
     python3 scripts/hosted_zones_tfvars.py [hosted-zones.json] [out.auto.tfvars.json]
 
-Writes tofu/lets-encrypt/hosted-zones.auto.tfvars.json by default, which
-OpenTofu loads automatically and .gitignore keeps out of the repo.
+Writes terraform/lets-encrypt/hosted-zones.auto.tfvars.json by default, which
+Terraform loads automatically and .gitignore keeps out of the repo.
 
-Validation happens here, before OpenTofu, for the reason the AWS workflow gives:
+Validation happens here, before Terraform, for the reason the AWS workflow gives:
 a malformed zone list otherwise surfaces minutes into a run, and a zone silently
-missing from the list makes OpenTofu plan to destroy that certificate (which
+missing from the list makes Terraform plan to destroy that certificate (which
 prevent_destroy then refuses, but only after the run has failed).
 """
 
@@ -30,7 +30,7 @@ RESOURCE_GROUP = re.compile(r"^[\w\-.()]{1,90}(?<!\.)$")
 
 def main() -> int:
     src = Path(sys.argv[1] if len(sys.argv) > 1 else "hosted-zones.json")
-    out = Path(sys.argv[2] if len(sys.argv) > 2 else "tofu/lets-encrypt/hosted-zones.auto.tfvars.json")
+    out = Path(sys.argv[2] if len(sys.argv) > 2 else "terraform/lets-encrypt/hosted-zones.auto.tfvars.json")
 
     try:
         doc = json.loads(src.read_text(encoding="utf-8"))
@@ -87,7 +87,7 @@ def main() -> int:
             if name in seen_zone:
                 problems.append(f"{name}: listed more than once")
             seen_zone.add(name)
-            # Keyed by zone name, so the OpenTofu address of a certificate is
+            # Keyed by zone name, so the Terraform address of a certificate is
             # stable when entries are reordered.
             resolved[name] = {
                 "dns_zone_prefix": prefix,

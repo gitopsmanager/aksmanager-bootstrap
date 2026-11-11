@@ -1,7 +1,7 @@
 # Copyright (c) 2026 GitOps Manager, S.L.
 # SPDX-License-Identifier: Apache-2.0
 # -----------------------------------------------------------------------------
-# tofu/cluster-identities — providers and backend
+# terraform/cluster-identities — providers and backend
 # -----------------------------------------------------------------------------
 # Applied by bootstrap-cluster-identities.yml as id-aksmanager-identities
 # (setup-pipeline.ps1 step 12b), signed in with az (ARM_USE_CLI).

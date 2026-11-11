@@ -1,7 +1,7 @@
 # Copyright (c) 2026 GitOps Manager, S.L.
 # SPDX-License-Identifier: Apache-2.0
 # -----------------------------------------------------------------------------
-# tofu/lets-encrypt — providers and backend
+# terraform/lets-encrypt — providers and backend
 # -----------------------------------------------------------------------------
 # Its own root module with its own state, as on AWS. It is applied on a schedule
 # with nobody watching, so whatever it can reach it can change unattended.

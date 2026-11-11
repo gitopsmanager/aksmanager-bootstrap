@@ -1,13 +1,13 @@
 # Copyright (c) 2026 GitOps Manager, S.L.
 # SPDX-License-Identifier: Apache-2.0
 # -----------------------------------------------------------------------------
-# tofu/lets-encrypt — one wildcard certificate per DNS zone
+# terraform/lets-encrypt — one wildcard certificate per DNS zone
 # -----------------------------------------------------------------------------
 # Issues *.<zone> from Let's Encrypt via DNS-01 against Azure DNS and stores the
 # result in Key Vault, one secret per zone. The agent reads those secrets and
 # pushes them into clusters; nothing here talks to Kubernetes.
 #
-# The Azure sibling of eksmanager-bootstrap/tofu/lets-encrypt. Same
+# The Azure sibling of eksmanager-bootstrap/terraform/lets-encrypt. Same
 # certificate, same secret shape, same renewal rule. What differs:
 #   - No assume-role hop. The identity running this holds a role assignment on
 #     each public zone directly (the custom TXT-only role), so a zone needs only
@@ -116,16 +116,9 @@ resource "azurerm_key_vault_secret" "wildcard" {
 
   # The Azure tag set the agent uses (AKSManager = Managed,
   # deployed_by = GitOpsManager), with managed_by naming what created the
-  # resource -- here this module, not the agent. The module creates
+  # resource -- here Terraform, not the agent. Terraform creates
   # these, so the agent treats them as read-only -- a manual save of the zone
   # certificate is refused rather than reverted by the next apply.
-  #
-  # The value stays "Terraform" now that OpenTofu applies the module: the
-  # job's vault guard, setup's guard and the agent all read it as "the
-  # pipeline wrote this", and every certificate already in a vault carries
-  # it. A new value would make each of them refuse the pipeline's own
-  # certificates. (eksmanager-bootstrap keeps its "Managed By" = "Terraform"
-  # for the same reason.)
   tags = {
     "AKSManager"  = "Managed"
     "deployed_by" = "GitOpsManager"

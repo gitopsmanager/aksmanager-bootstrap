@@ -3,12 +3,12 @@
 name: bootstrap-cluster-identities
 
 # Add ONE missing workload identity to an AKS cluster -- external-dns,
-# external-secrets, or aso (the node pool operator) -- with OpenTofu
-# (tofu/cluster-identities). Started by the GUI's "set up new node pools" run
+# external-secrets, or aso (the node pool operator) -- with Terraform
+# (terraform/cluster-identities). Started by the GUI's "set up new node pools" run
 # (Node pools tab), before the component that needs the identity is
 # installed; the Azure create, when it exists, makes all three the same way.
 #
-# Create-if-missing, never anything else:
+# mode create (create-if-missing):
 #   - each identity has its own state (identities/<cluster>/<identity>.tfstate
 #     in its own container), and a run continues it, so a run that failed
 #     half way can be re-run
@@ -16,6 +16,13 @@ name: bootstrap-cluster-identities
 #     never imported, changed or replaced
 #   - the cluster's OIDC issuer and workload identity must already be on:
 #     turning the issuer on cannot be undone, so it is never done here
+# mode update: the identity as the code has it now (new role assignments),
+# for an identity with a state here; refused without one. This is the only
+# way ASO's own identity changes: ASO can never grant itself more.
+#
+# Both modes refuse a plan that deletes or replaces anything
+# (scripts/plan_guard.py): grants are added and changed, never removed by a
+# replacement.
 #
 # Signs in as id-aksmanager-identities (setup-pipeline.ps1 step 12b), which
 # may create identities in the shared services resource group and assign
@@ -24,7 +31,7 @@ name: bootstrap-cluster-identities
 # committed as the GitHub App: repository variable GOM_APP_CLIENT_ID and secret
 # GOM_APP_PRIVATE_KEY, both required.
 
-run-name: "Cluster identity ${{ inputs.identity }} for ${{ inputs.cluster }}${{ inputs.dry_run && ' (plan only)' || '' }} -- ${{ inputs.requested_by || github.actor }} [${{ inputs.plan_step }}]"
+run-name: "Cluster identity ${{ inputs.identity }} (${{ inputs.mode }}) for ${{ inputs.cluster }}${{ inputs.dry_run && ' (plan only)' || '' }} -- ${{ inputs.requested_by || github.actor }} [${{ inputs.plan_step }}]"
 
 on:
   workflow_dispatch:
@@ -49,6 +56,13 @@ on:
           - aso
           - external-secrets
           - external-dns
+      mode:
+        description: "create: only when missing. update: bring an existing one up to the code (new grants)."
+        type: choice
+        default: create
+        options:
+          - create
+          - update
       dns_zone_ids:
         description: "external-dns only: the zones' resource IDs, comma separated"
         type: string
@@ -128,6 +142,9 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               for name, key in need.items():
                   out.write(f"{name}={p[key]}\n")
+              # Optional: a setup run from before workload identities has none,
+              # and the aso identity is then made without that role.
+              out.write(f"app_identity_role={p.get('app_identity_role', '')}\n")
               out.write(f"tag_name={p.get('resource_tag_name') or ''}\n")
               out.write(f"tag_value={p.get('resource_tag_value') or ''}\n")
           PY
@@ -188,6 +205,7 @@ jobs:
         env:
           CLUSTER: ${{ inputs.cluster }}
           IDENTITY: ${{ inputs.identity }}
+          MODE: ${{ inputs.mode }}
           SHARED_SUB: ${{ steps.setup.outputs.shared_sub }}
           IDENTITY_RG: ${{ steps.setup.outputs.identity_rg }}
           STATE_ACCOUNT: ${{ steps.setup.outputs.state_account }}
@@ -200,6 +218,10 @@ jobs:
             echo "State $key exists: continuing it."
             exit 0
           fi
+          if [ "$MODE" = update ]; then
+            echo "::error::$IDENTITY on $CLUSTER has no state here ($key): it was not made by this workflow, so it is never changed here. Run mode create first."
+            exit 1
+          fi
           name="$CLUSTER-$IDENTITY"
           if az identity show -n "$name" -g "$IDENTITY_RG" --subscription "$SHARED_SUB" -o none 2>/dev/null; then
             echo "::error::$name already exists in $IDENTITY_RG but was not made by this workflow (no state at $key). It is never imported or changed here."
@@ -207,21 +229,14 @@ jobs:
           fi
           echo "$name does not exist: creating it."
 
-      - name: OpenTofu
-        run: |
-          set -euo pipefail
-          TOFU_VERSION=1.13.1
-          base="https://github.com/opentofu/opentofu/releases/download/v${TOFU_VERSION}"
-          cd "$RUNNER_TEMP"
-          curl -fsSLO "${base}/tofu_${TOFU_VERSION}_linux_amd64.zip"
-          curl -fsSLO "${base}/tofu_${TOFU_VERSION}_SHA256SUMS"
-          grep " tofu_${TOFU_VERSION}_linux_amd64.zip\$" "tofu_${TOFU_VERSION}_SHA256SUMS" | sha256sum -c -
-          unzip -q -o "tofu_${TOFU_VERSION}_linux_amd64.zip" tofu -d "$RUNNER_TEMP/bin"
-          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Install Terraform
+        # Pinned: must match the other Terraform runs.
+        shell: bash
+        run: bash scripts/install_terraform.sh 1.17.1
 
       - name: Plan and apply
         id: apply
-        working-directory: tofu/cluster-identities
+        working-directory: terraform/cluster-identities
         env:
           ARM_USE_CLI: "true"
           ARM_TENANT_ID: ${{ steps.setup.outputs.tenant_id }}
@@ -239,6 +254,7 @@ jobs:
           CLUSTER_ID: ${{ steps.cluster.outputs.cluster_id }}
           OIDC_ISSUER: ${{ steps.cluster.outputs.oidc_issuer }}
           NODE_POOL_ROLE: ${{ steps.setup.outputs.node_pool_role }}
+          APP_IDENTITY_ROLE: ${{ steps.setup.outputs.app_identity_role }}
           TAG_NAME: ${{ steps.setup.outputs.tag_name }}
           TAG_VALUE: ${{ steps.setup.outputs.tag_value }}
           SHARED_SUB: ${{ steps.setup.outputs.shared_sub }}
@@ -249,7 +265,7 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           import json, os
-          tags = {"AKSManager": "Managed", "deployed_by": "GitOpsManager", "managed_by": "OpenTofu",
+          tags = {"AKSManager": "Managed", "deployed_by": "GitOpsManager", "managed_by": "Terraform",
                   "cluster": os.environ["CLUSTER"]}
           if os.environ["TAG_NAME"]:
               tags[os.environ["TAG_NAME"]] = os.environ["TAG_VALUE"]
@@ -264,26 +280,36 @@ jobs:
               "dns_zone_ids": json.loads(os.environ["ZONES"]),
               "key_vault_id": os.environ["KV_ID"],
               "aso_role_name": os.environ["NODE_POOL_ROLE"],
+              "aso_app_identity_role_name": os.environ["APP_IDENTITY_ROLE"],
+              "app_identity_scopes": [f"/subscriptions/{os.environ['SUB']}"],
+              # The client's own additions to the roles workload identities may
+              # be given (app-grant-roles.json, theirs; example-app-grant-roles.json).
+              "app_grant_extra_roles": (json.load(open("app-grant-roles.json")).get("roles") or [])
+                                       if os.path.exists("app-grant-roles.json") else [],
               "subnet_vnet_ids": json.loads(os.environ["VNETS"]),
           }, open("identity.auto.tfvars.json", "w"), indent=2)
           PY
-          tofu init -input=false \
+          terraform init -input=false \
             "-backend-config=storage_account_name=${STATE_ACCOUNT}" \
             "-backend-config=container_name=${STATE_CONTAINER}" \
             "-backend-config=key=identities/${CLUSTER}/${IDENTITY}.tfstate" \
             "-backend-config=subscription_id=${SHARED_SUB}" \
             "-backend-config=tenant_id=${ARM_TENANT_ID}"
           set +e
-          tofu plan -input=false -detailed-exitcode -out=tfplan
+          terraform plan -input=false -detailed-exitcode -out=tfplan
           rc=$?
           set -e
           case "$rc" in 0) echo "No changes" ;; 2) echo "Changes planned" ;; *) echo "::error::plan failed"; exit 1 ;; esac
+          if [ "$rc" = 2 ]; then
+            terraform show -json tfplan > "$RUNNER_TEMP/identity.plan.json"
+            python3 "$GITHUB_WORKSPACE/scripts/plan_guard.py" "$RUNNER_TEMP/identity.plan.json" || { echo "::error::refused, nothing applied"; exit 1; }
+          fi
           if [ "$DRY_RUN" = true ]; then
             echo "Plan only: nothing applied." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          [ "$rc" = 2 ] && tofu apply -input=false tfplan
-          echo "client_id=$(tofu output -raw client_id)" >> "$GITHUB_OUTPUT"
+          [ "$rc" = 2 ] && terraform apply -input=false tfplan
+          echo "client_id=$(terraform output -raw client_id)" >> "$GITHUB_OUTPUT"
 
       # Where the operator's settings read it (private-core-stack's
       # azure-service-operator chart). Every run, so re-running fixes a cluster
@@ -296,7 +322,7 @@ jobs:
           KV_NAME: ${{ steps.setup.outputs.key_vault_name }}
         run: |
           set -euo pipefail
-          [ -n "$CLIENT_ID" ] || { echo "::error::No client ID from OpenTofu"; exit 1; }
+          [ -n "$CLIENT_ID" ] || { echo "::error::No client ID from Terraform"; exit 1; }
           az keyvault secret set --vault-name "$KV_NAME" --name "$CLUSTER-aso-client-id" --value "$CLIENT_ID" \
             --tags managed_by=AKSManagerAgent deployed_by=GitOpsManager --output none ||
             { echo "::error::Could not write $CLUSTER-aso-client-id to $KV_NAME. If this identity lacks the role, re-run setup-pipeline.ps1 (step 12b)."; exit 1; }

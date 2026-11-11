@@ -1,0 +1,131 @@
+# Copyright (c) 2026 GitOps Manager, S.L.
+# SPDX-License-Identifier: Apache-2.0
+# The last step of a create: the bootstrap pool goes, now that the cluster's
+# operator runs the real pools. Started by the GUI's handover run (a plan run,
+# after the core stack), whose earlier steps
+#   1. wrote the system and general pools into the client's node pools file
+#      and rendered them (the core-stack nodepools task): Azure Service
+#      Operator made them, the system pool in System mode with
+#      CriticalAddonsOnly;
+#   2. handed the create's kubelet and control-plane identities to ASO
+#      (cd-files.yml adopt-cluster-identities, core-stack tools/cd_adopt.py).
+#      Their role assignments stay Terraform's (1-cluster): they are not on
+#      ASO's fixed list.
+# This run:
+#   - checks that every pool but bootstrap has succeeded with nodes, and that
+#     one of them is a System pool, and refuses otherwise: AKS refuses to
+#     delete its last System pool, and the system pods need somewhere to go;
+#   - deletes the bootstrap pool (az aks nodepool delete; AKS drains it).
+#     1-cluster ignores default_node_pool, so no apply ever brings it back.
+# Safe to run again: a pool already gone is nothing to do.
+name: bootstrap-handover
+
+run-name: "Handover ${{ inputs.cluster }} -- ${{ inputs.requested_by || github.actor }} [${{ inputs.plan_step }}]"
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster:
+        description: "Cluster name: clusters/<cluster>.json"
+        required: true
+        type: string
+      requested_by:
+        description: "The GUI user, when the GUI starts it"
+        type: string
+        default: ""
+      plan_step:
+        description: "The GUI's plan step id, for matching this run (in the run name)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: create-cluster-${{ inputs.cluster }}
+  cancel-in-progress: false
+
+jobs:
+  handover:
+    runs-on: ${{ vars.CREATE_CLUSTER_RUNNER || 'gom-azure-long' }}
+    timeout-minutes: 60
+    steps:
+      - name: Check out this repo
+        uses: actions/checkout@v7
+
+      - name: The cluster file
+        id: spec
+        env:
+          CLUSTER: ${{ inputs.cluster }}
+        run: |
+          set -euo pipefail
+          [[ "$CLUSTER" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] || { echo "::error::Not a cluster name: $CLUSTER"; exit 1; }
+          [ -f "clusters/$CLUSTER.json" ] || { echo "::error::No clusters/$CLUSTER.json: only a cluster made by bootstrap-create-cluster.yml has a bootstrap pool"; exit 1; }
+          python3 - "clusters/$CLUSTER.json" <<'PY'
+          import json, os, sys
+          s = json.load(open(sys.argv[1]))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"subscription={s['subscription_id']}\nresource_group={s['resource_group']}\n")
+          PY
+          tenant=$(python3 -c 'import json; print(json.load(open("pinned.auto.tfvars.json"))["tenant_id"])')
+          echo "tenant=$tenant" >> "$GITHUB_OUTPUT"
+
+      # As bootstrap-create-cluster.yml signs in.
+      - uses: azure/login@v2
+        if: ${{ vars.AZURE_CREATE_CLIENT_ID != '' }}
+        with:
+          client-id: ${{ vars.AZURE_CREATE_CLIENT_ID }}
+          tenant-id: ${{ steps.spec.outputs.tenant }}
+          allow-no-subscriptions: true
+
+      - name: Sign in as the runner
+        if: ${{ vars.AZURE_CREATE_CLIENT_ID == '' }}
+        run: |
+          set -euo pipefail
+          [ -n "${AZURE_CLIENT_ID:-}" ] || { echo "::error::Not on GitOps Manager's Azure runner (no AZURE_CLIENT_ID): set AZURE_CREATE_CLIENT_ID for workload identity federation."; exit 1; }
+          az login --identity --client-id "$AZURE_CLIENT_ID" --allow-no-subscriptions --output none
+
+      - name: The operator's pools are running
+        id: pools
+        env:
+          CLUSTER: ${{ inputs.cluster }}
+          SUB: ${{ steps.spec.outputs.subscription }}
+          RG: ${{ steps.spec.outputs.resource_group }}
+        run: |
+          set -euo pipefail
+          az aks nodepool list --cluster-name "$CLUSTER" --resource-group "$RG" --subscription "$SUB" -o json > "$RUNNER_TEMP/pools.json"
+          python3 - "$RUNNER_TEMP/pools.json" <<'PY'
+          import json, os, sys
+          pools = json.load(open(sys.argv[1]))
+          others = [p for p in pools if p["name"] != "bootstrap"]
+          for p in others:
+              print(f"{p['name']}: {p.get('mode')}, {p.get('provisioningState')}, {p.get('count')} node(s), {p.get('powerState', {}).get('code')}")
+          bad = [p["name"] for p in others if p.get("provisioningState") != "Succeeded" or not p.get("count")
+                 or (p.get("powerState") or {}).get("code") != "Running"]
+          if not others:
+              sys.exit("::error::No pool but bootstrap: the handover's node pools step has not made any")
+          if bad:
+              sys.exit(f"::error::Not running yet: {', '.join(bad)}. The bootstrap pool stays until every operator pool runs.")
+          if not any(p.get("mode") == "System" for p in others):
+              sys.exit("::error::No System pool among the operator's: AKS keeps its last System pool, and the system pods need one")
+          gone = not any(p["name"] == "bootstrap" for p in pools)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"gone={'true' if gone else 'false'}\n")
+          PY
+
+      - name: The bootstrap pool goes
+        if: ${{ steps.pools.outputs.gone != 'true' }}
+        env:
+          CLUSTER: ${{ inputs.cluster }}
+          SUB: ${{ steps.spec.outputs.subscription }}
+          RG: ${{ steps.spec.outputs.resource_group }}
+        run: |
+          set -euo pipefail
+          az aks nodepool delete --cluster-name "$CLUSTER" --resource-group "$RG" --subscription "$SUB" --name bootstrap
+          echo "Deleted the bootstrap pool on $CLUSTER: its pods moved to the operator's pools." | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Nothing to do
+        if: ${{ steps.pools.outputs.gone == 'true' }}
+        run: |
+          echo "No bootstrap pool on ${{ inputs.cluster }}: handed over already." | tee -a "$GITHUB_STEP_SUMMARY"

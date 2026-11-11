@@ -11,34 +11,30 @@
 #
 # Everything runs as the job's managed identity, id-aksmanager-letsencrypt.
 # The identity's reach is limited to certificates: TXT records in the public
-# zones, the Key Vault secrets, and the certificate OpenTofu state.
+# zones, the Key Vault secrets, and the certificate Terraform state.
 #
 # Steps:
 #   1. Tools: the image is mcr.microsoft.com/azure-cli (az, python3); git,
-#      unzip and openssl are added with tdnf, and OpenTofu is downloaded at a
-#      pinned release, checksum verified against the release's SHA256SUMS.
-#   2. Sign in: az login --identity. OpenTofu and lego both use that az login
-#      (ARM_USE_CLI, azure_auth_method=cli). The azurerm backend could not use
-#      a Container Apps managed identity directly -- it did not support the
-#      platform's IDENTITY_ENDPOINT (hashicorp/terraform#37268) -- and the az
-#      login is the documented workaround, which OpenTofu's backend supports
-#      the same way (use_cli).
+#      unzip and openssl are added with tdnf, and Terraform is downloaded at
+#      its current release, checksum verified.
+#   2. Sign in: az login --identity. Terraform and lego both use that az login
+#      (ARM_USE_CLI, azure_auth_method=cli). Terraform's azurerm backend cannot
+#      use a Container Apps managed identity directly -- it does not support
+#      the platform's IDENTITY_ENDPOINT (hashicorp/terraform#37268) -- and the
+#      az login is the documented workaround.
 #   3. The private repo, cloned with the bootstrap GitHub App (credentials in
 #      Key Vault as global-bootstrap-github-app), for hosted-zones.json and
-#      tofu/lets-encrypt (terraform/lets-encrypt in a repo not yet synced
-#      since the move).
+#      terraform/lets-encrypt.
 #   4. hosted-zones.json validated by scripts/hosted_zones_tfvars.py.
 #   5. The vault guard: a zone whose <prefix>-dns-zone-certs was not written
 #      by the pipeline (a manually saved certificate, live or soft-deleted) is
 #      left out, as in setup. Manual certificates are never overwritten.
-#   6. tofu init + the empty-state guard + tofu apply.
+#   6. terraform init + the empty-state guard + terraform apply.
 #
 # Configuration comes from the job's environment, set by setup-pipeline.ps1.
-# TOFU_VERSION overrides the pinned OpenTofu release when set.
+# TERRAFORM_VERSION overrides the pinned Terraform release (1.17.1, the version
+# that wrote this state).
 # ALLOW_EMPTY_STATE=true overrides the empty-state guard (see below).
-# PLAN_ONLY=true plans instead of applying: nothing is issued, renewed or
-# written, and the run reports whether the plan has changes. For checking a
-# change -- the move to OpenTofu -- against the live state first.
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
@@ -63,20 +59,20 @@ if [ ${#need[@]} -gt 0 ]; then
     tdnf install -y -q "${need[@]}" >/dev/null || die "could not install ${need[*]}"
 fi
 
-# Pinned, as on AWS (eksmanager-bootstrap's buildspecs): a release arriving on
-# its own would surface at renewal, unattended.
-TOFU_VERSION="${TOFU_VERSION:-1.13.1}"
-log "OpenTofu $TOFU_VERSION"
+# Pinned: a state written by a newer Terraform cannot be read by an older one,
+# so the version only moves deliberately, with the AWS builds.
+TF_VERSION="${TERRAFORM_VERSION:-1.17.1}"
+log "Terraform $TF_VERSION"
 (
     cd "$WORK"
-    base="https://github.com/opentofu/opentofu/releases/download/v${TOFU_VERSION}"
-    curl -fsSLO "${base}/tofu_${TOFU_VERSION}_linux_amd64.zip"
-    curl -fsSLO "${base}/tofu_${TOFU_VERSION}_SHA256SUMS"
-    grep " tofu_${TOFU_VERSION}_linux_amd64.zip\$" "tofu_${TOFU_VERSION}_SHA256SUMS" | sha256sum -c --quiet - ||
-        die "OpenTofu ${TOFU_VERSION} failed its checksum"
-    unzip -q -o "tofu_${TOFU_VERSION}_linux_amd64.zip" tofu -d /usr/local/bin
+    base="https://releases.hashicorp.com/terraform/${TF_VERSION}"
+    curl -fsSO "${base}/terraform_${TF_VERSION}_linux_amd64.zip"
+    curl -fsSO "${base}/terraform_${TF_VERSION}_SHA256SUMS"
+    grep " terraform_${TF_VERSION}_linux_amd64.zip\$" "terraform_${TF_VERSION}_SHA256SUMS" | sha256sum -c --quiet - ||
+        die "Terraform ${TF_VERSION} failed its checksum"
+    unzip -q -o "terraform_${TF_VERSION}_linux_amd64.zip" -d /usr/local/bin
 )
-tofu version
+terraform version
 
 # ── 2. Sign in as the job's managed identity ──────────────────────────────────
 log "Signing in as managed identity $AZURE_CLIENT_ID"
@@ -86,7 +82,7 @@ az login --identity --client-id "$AZURE_CLIENT_ID" --allow-no-subscriptions -o n
     die "az login --identity failed -- is $AZURE_CLIENT_ID assigned to this job?"
 # Best effort. The identity's roles are on resources, not the subscription, so
 # az may not list the subscription at all; nothing below depends on it --
-# OpenTofu takes ARM_SUBSCRIPTION_ID and Key Vault calls name the vault.
+# Terraform takes ARM_SUBSCRIPTION_ID and Key Vault calls name the vault.
 az account set --subscription "$SUBSCRIPTION_ID" 2>/dev/null || true
 
 # ── 3. The private repo, through the bootstrap GitHub App ─────────────────────
@@ -131,16 +127,9 @@ unset GH_TOKEN auth
 cd "$WORK/repo"
 log "At commit $(git rev-parse --short HEAD): $(git log -1 --format=%s)"
 
-# The module's folder: tofu/lets-encrypt since the move to OpenTofu,
-# terraform/lets-encrypt in a private repo not yet synced since. Either works
-# here; the state is the same blob whichever folder applies it.
-MODULE=tofu/lets-encrypt
-[ -d "$MODULE" ] || MODULE=terraform/lets-encrypt
-[ -d "$MODULE" ] || die "neither tofu/lets-encrypt nor terraform/lets-encrypt is in ${GITHUB_ORG}/${GITHUB_REPO_NAME}"
-
 # ── 4. hosted-zones.json ──────────────────────────────────────────────────────
-TFVARS="$MODULE/hosted-zones.auto.tfvars.json"
-python3 scripts/hosted_zones_tfvars.py hosted-zones.json "$TFVARS" || die "hosted-zones.json did not validate (see above)"
+TFVARS=terraform/lets-encrypt/hosted-zones.auto.tfvars.json
+python3 scripts/hosted_zones_tfvars.py || die "hosted-zones.json did not validate (see above)"
 
 # ── 5. Vault guard ────────────────────────────────────────────────────────────
 log "Vault guard"
@@ -150,8 +139,6 @@ import json, re, sys
 tags = json.load(sys.stdin) or {}
 print(next((v for k, v in tags.items() if re.sub(r"[^a-z0-9]", "", k.lower()) == "managedby"), ""))'
 }
-# "Terraform" is the pipeline's managed_by value, kept after the move to
-# OpenTofu (tofu/lets-encrypt/main.tf says why).
 blocked=()
 keep=()
 while IFS=$'\t' read -r key prefix zone; do
@@ -190,15 +177,15 @@ doc["hosted_zones"] = {k: v for k, v in doc["hosted_zones"].items() if k in keep
 json.dump(doc, open(path, "w"), indent=2)' "$TFVARS" "${keep[@]}"
 fi
 
-# ── 6. OpenTofu ───────────────────────────────────────────────────────────────
+# ── 6. Terraform ──────────────────────────────────────────────────────────────
 export ARM_USE_CLI=true
 export ARM_SUBSCRIPTION_ID="$SUBSCRIPTION_ID"
 export ARM_TENANT_ID="$TENANT_ID"
 export TF_IN_AUTOMATION=1
-cd "$MODULE"
+cd terraform/lets-encrypt
 
-log "tofu init"
-tofu init -input=false \
+log "terraform init"
+terraform init -input=false \
     "-backend-config=storage_account_name=${STATE_ACCOUNT}" \
     "-backend-config=container_name=${STATE_CONTAINER}" \
     "-backend-config=key=${STATE_KEY}" \
@@ -209,12 +196,12 @@ tofu init -input=false \
 # Empty-state guard, as in setup and on AWS. An empty state while the vault
 # already holds certificates the pipeline wrote means the state was lost, not
 # never created: applying would try to recreate every secret.
-managed=$(tofu state list 2>/dev/null | grep -c -v '^data\.' || true)
+managed=$(terraform state list 2>/dev/null | grep -c -v '^data\.' || true)
 if [ "${managed:-0}" -eq 0 ] && [ "${ALLOW_EMPTY_STATE:-}" != "true" ]; then
     ours=$(az keyvault secret list --vault-name "$KEY_VAULT_NAME" \
         --query "[?tags.managed_by=='Terraform'].name" -o tsv | tr '\n' ' ')
     if [ -n "${ours// /}" ]; then
-        die "the OpenTofu state ${STATE_ACCOUNT}/${STATE_CONTAINER}/${STATE_KEY} is empty, but
+        die "the Terraform state ${STATE_ACCOUNT}/${STATE_CONTAINER}/${STATE_KEY} is empty, but
 $KEY_VAULT_NAME already holds certificates the pipeline wrote ($ours). The state has
 been lost; applying would try to recreate them. Check the blob's versions:
   az storage blob list --account-name $STATE_ACCOUNT --container-name $STATE_CONTAINER --auth-mode login --include v -o table
@@ -222,7 +209,7 @@ If this really is a fresh start, set ALLOW_EMPTY_STATE=true on the job for one r
     fi
 fi
 
-# Staging -> production. OpenTofu renews only inside min_days_remaining, so
+# Staging -> production. Terraform renews only inside min_days_remaining, so
 # after acme-staging is turned off a zone would keep its staging certificate --
 # untrusted root -- for about two months. -replace cannot force it either:
 # prevent_destroy refuses the destroy half. So when staging is off and any
@@ -252,36 +239,38 @@ fi
 # while PLANNING, and fails with accountDoesNotExist before the registration in
 # the same apply could run. A targeted apply creates it first. On every other
 # run this changes nothing.
-tf_vars=(
-    "-var=shared_services_subscription_id=${SUBSCRIPTION_ID}"
-    "-var=key_vault_id=${KEY_VAULT_ID}"
-    "-var=azure_auth_method=cli"
-)
-
+# PLAN_ONLY=true (an override on the job start): plan instead of applying.
+# Nothing is issued, renewed or written, not even the ACME account; the run
+# reports whether the plan has changes. -detailed-exitcode: 0 no changes,
+# 2 changes, 1 error. Unset, the job applies exactly as before.
 if [ "${PLAN_ONLY:-}" = "true" ]; then
-    # No apply at all, not even the ACME account's. -detailed-exitcode: 0 no
-    # changes, 2 changes, 1 error. After the move to OpenTofu a plan with no
-    # changes is the result to expect: same state, same providers.
-    log "tofu plan (PLAN_ONLY: nothing is applied)"
+    log "terraform plan (PLAN_ONLY: nothing is applied)"
     set +e
-    tofu plan -input=false -detailed-exitcode "${tf_vars[@]}" "${renew_args[@]}"
+    terraform plan -input=false -detailed-exitcode         "-var=shared_services_subscription_id=${SUBSCRIPTION_ID}"         "-var=key_vault_id=${KEY_VAULT_ID}"         "-var=azure_auth_method=cli"         "${renew_args[@]}"
     rc=$?
     set -e
     case "$rc" in
         0) log "PLAN_ONLY: no changes" ;;
         2) log "PLAN_ONLY: the plan has changes (above); nothing was applied" ;;
-        *) die "tofu plan failed" ;;
+        *) die "terraform plan failed" ;;
     esac
     log "Done"
     exit 0
 fi
 
-log "tofu apply (ACME account)"
-tofu apply -input=false -auto-approve -target=acme_registration.this "${tf_vars[@]}"
+log "terraform apply (ACME account)"
+terraform apply -input=false -auto-approve -target=acme_registration.this \
+    "-var=shared_services_subscription_id=${SUBSCRIPTION_ID}" \
+    "-var=key_vault_id=${KEY_VAULT_ID}" \
+    "-var=azure_auth_method=cli"
 
-log "tofu apply"
-tofu apply -input=false -auto-approve "${tf_vars[@]}" "${renew_args[@]}"
+log "terraform apply"
+terraform apply -input=false -auto-approve \
+    "-var=shared_services_subscription_id=${SUBSCRIPTION_ID}" \
+    "-var=key_vault_id=${KEY_VAULT_ID}" \
+    "-var=azure_auth_method=cli" \
+    "${renew_args[@]}"
 
 log "Certificates:"
-tofu output -json certificate_expiry 2>/dev/null || true
+terraform output -json certificate_expiry 2>/dev/null || true
 log "Done"

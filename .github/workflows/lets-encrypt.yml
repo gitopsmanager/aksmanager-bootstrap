@@ -10,14 +10,11 @@ name: Run lets encrypt certificate job
 # Run this after editing hosted-zones.json -- adding a zone, moving between
 # staging and production -- or after syncing new code from the public repo.
 # You do NOT need to run it for renewals: the job runs weekly on its own
-# schedule, and OpenTofu reissues only certificates inside min_days_remaining.
+# schedule, and Terraform reissues only certificates inside min_days_remaining.
 #
 # The certificates are issued inside Azure by the job, as its own managed
 # identity. This workflow never sees them: its identity, id-aksmanager-github,
-# can start and stop the job, read its logs, and give the job its TXT-only
-# DNS-01 role on a zone added to hosted-zones.json -- that one role, to that
-# one identity, nothing else (setup's conditional grant). Changes to
-# hosted-zones.json are gated by a push ruleset restricting it to approvers.
+# can only start and stop the job and read its logs.
 #
 # Needs no repository variables. setup-pipeline.ps1 writes everything this
 # reads into pinned.auto.tfvars.json, and creates the federated credential
@@ -38,7 +35,7 @@ jobs:
 
       # Fail here rather than in the job. The job validates again with the same
       # script, but a malformed zone list is quicker to see here, and a zone
-      # silently missing makes OpenTofu destroy that certificate and its
+      # silently missing makes Terraform destroy that certificate and its
       # secret.
       - name: Validate hosted-zones.json
         run: python3 scripts/hosted_zones_tfvars.py hosted-zones.json "$RUNNER_TEMP/hosted-zones.auto.tfvars.json"
@@ -60,16 +57,16 @@ jobs:
               "job_name":        "lets_encrypt_job_name",
               "workspace_id":    "log_analytics_workspace_customer_id",
           }
-          missing = [k for k in need.values() if not p.get(k)]
-          if missing:
-              sys.exit("pinned.auto.tfvars.json has no " + ", ".join(missing) +
-                       " -- re-run setup-pipeline.ps1 (an older run did not create the job).")
-          # For the grant step. Optional, so a pinned file written by an older
-          # setup still runs the job; the grant step then says to re-run setup.
+          # For the grant step. Written to pinned.auto.tfvars.json only when setup
+          # ran with ZONE_GRANTS=1 (opt-in); absent, the grant step does nothing.
           optional = {
               "cert_principal_id": "cert_identity_principal_id",
               "cert_dns_role":     "cert_dns_role",
           }
+          missing = [k for k in need.values() if not p.get(k)]
+          if missing:
+              sys.exit("pinned.auto.tfvars.json has no " + ", ".join(missing) +
+                       " -- re-run setup-pipeline.ps1 (an older run did not create the job).")
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               for name, key in need.items():
                   out.write(f"{name}={p[key]}\n")
@@ -115,7 +112,7 @@ jobs:
 
       # The job writes each zone's challenge record as its own identity, which
       # holds the TXT-only DNS-01 role per public zone. Setup grants it for the
-      # zones it saw; this grants it for any zone added to hosted-zones.json
+      # zones it saw; with ZONE_GRANTS=1 this grants it for any zone added to hosted-zones.json
       # since, so a new zone needs no setup run.
       #
       # This identity may do exactly that and nothing else: setup gives it Role
@@ -130,8 +127,9 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "$JOB_PRINCIPAL_ID" ] || [ -z "$DNS_ROLE" ]; then
-            echo "::warning::pinned.auto.tfvars.json is from an older setup, so this workflow cannot grant DNS access for new zones."
-            echo "Re-run setup-pipeline.ps1 once. Zones setup already saw are unaffected."
+            # Opt-in: setup-pipeline.ps1 with ZONE_GRANTS=1 writes both. Off, a new
+            # zone needs a setup run, as before.
+            echo "Zone grants not enabled (setup ZONE_GRANTS=1): nothing to grant."
             exit 0
           fi
 
