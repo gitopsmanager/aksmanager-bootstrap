@@ -27,7 +27,7 @@ stage can be re-run without the others.
 | (workflow) | The resource group, if missing, tagged only when made here | `create_resource_group` |
 | `1-cluster` | `traefik_nic` holding Traefik's private IP (the subnet's address with the last octet 100) | `create_traefik_nic_with_private_ip`, `af7task.get_fixed_ip_from_subnet_cidr` |
 | | `kubelet-<c>` and `control-plane-<c>` identities | `create_managed_identity` |
-| | kubelet: AcrPull on the registry. Control plane: Managed Identity Operator on the kubelet identity, Contributor on the cluster's resource group, Network Contributor on the subnet and on the node resource group | `assign_aks_managed_ids` (the first role: `az aks create` granted it itself) |
+| | kubelet: AcrPull on the registry. Control plane: Managed Identity Operator on the kubelet identity, Network Contributor on the subnet and on the node resource group (the node resource group covers kubenet's route table). No Contributor on the cluster's resource group: dropped 12 Nov 2026, in the agent too, as nothing these clusters use needs it | `assign_aks_managed_ids` (the first role: `az aks create` granted it itself) |
 | | The cluster: Entra admin groups and Azure RBAC, subnet, zones, upgrade channels, tier, network plugin, policy and overlay mode, the Cilium data plane, pod and service CIDRs, DNS service IP, workload identity and the OIDC issuer, the managed tags on the cluster and its first pool | `az aks create` |
 | | The maintenance windows `aksManagedAutoUpgradeSchedule` and `aksManagedNodeOSUpgradeSchedule` (weekly) | `create_maintenance_schedules` |
 | | The first node pool, `bootstrap` (mode System, one node per zone, the system pool's size and disk) | `--nodepool-name nodepool1` |
@@ -57,17 +57,31 @@ Removing a namespace from the cluster file makes the plan fail rather than
 delete the namespace. Removing the cluster from a run is refused
 (`prevent_destroy`).
 
-## 3-handover (not here yet)
+## 3-handover
 
-**Placeholder:** written separately. After the core stack has installed the
-Azure Service Operator, the handover:
-1. renders the cluster file's `node_pools.system` (mode System, taint
+**Built, not yet tested.** Not a Terraform stage: a request the GitOps Manager
+GUI runs, started by itself after a create (the core stack first, then this
+handover queued behind it), and from Node pools ("Hand over from the create")
+to retry. After the core stack has installed the Azure Service Operator, it:
+1. turns `install_node_pool_operator` on in the stack file, with ASO's client
+   ID from the create's identities;
+2. renders the cluster file's `node_pools.system` (mode System, taint
    `CriticalAddonsOnly=true:NoSchedule`, as the agent's `taint_system_nodepool`)
    and `node_pools.general` into the CD repo (`<cluster>/nodepools/`) as ASO
-   agent pools, commits, and syncs;
-2. waits until ASO reports both Ready;
-3. deletes the `bootstrap` pool (`az aks nodepool delete`; Terraform already
-   ignores `default_node_pool`), and the system pods move across.
+   agent pools, syncs them, and waits until ASO reports every one Ready;
+3. hands the kubelet and control-plane identities to ASO (`cd-files.yml`
+   `adopt-cluster-identities`). Their role assignments stay Terraform's;
+4. runs [`bootstrap-handover.yml`](../../.github/workflows/bootstrap-handover.yml):
+   it refuses unless every pool but `bootstrap` has succeeded with nodes and
+   one is a System pool, then deletes the `bootstrap` pool
+   (`az aks nodepool delete`; Terraform already ignores `default_node_pool`),
+   and the system pods move across. Safe to run again.
+
+One way: once handed over, the pools and the adopted identities belong to the
+CD repo, not Terraform. If a pool can't be made (quota, a bad VM size), the
+request stops at step 2 and the cluster keeps working on `bootstrap`: fix
+`clusters/<c>.json` and press Retry on the Requests page. A handover that stays
+failed or running for over an hour raises the `handover-stuck` ops alert.
 
 What it can rely on from this create, in `clusters/<c>.outputs.json` and
 1-cluster's outputs: `cluster_id`, `oidc_issuer_url`, `node_resource_group`,
@@ -87,7 +101,7 @@ Until the handover, the bootstrap pool runs everything. Traefik waits for
 | Who may change what after create | The agent, everything it made (`managed_by = AKSManagerAgent`) | The cluster, its identities and their roles are Terraform's (`managed_by = Terraform`), so the GUI and agent treat the cluster as another tool's, as the EKS create does. The Argo CD admin secret is tagged `AKSManagerAgent`, so the GUI may set a new value | As the EKS create (29 Oct 2026) |
 | Kubernetes version | The exact patch from the page | The exact patch, or major.minor for the newest patch AKS offers | As the GKE create |
 | Managed Identity Operator for the control plane on the kubelet identity | Granted by `az aks create` | An explicit role assignment | azurerm does not grant it |
-| Order of the role assignments | All after the cluster | Contributor on the resource group and Network Contributor on the subnet before it (the cluster needs them to come up); the node resource group after | The same assignments |
+| Order of the role assignments | All after the cluster | Managed Identity Operator and Network Contributor on the subnet before it (the cluster needs them to come up); the node resource group after | The same assignments, less Contributor |
 | SSH key on the nodes | `--generate-ssh-keys` (a key on the agent's disk that nothing uses) | None | A private key would sit in Terraform's state |
 | Maintenance window start date | Today, when the page gives none | Azure's default (the day it is set), so a re-run does not move it | The same result on the first run |
 | A re-run on a half-made cluster | Refused unless `Succeeded` | Terraform carries on from its state | |
@@ -109,21 +123,11 @@ Until the handover, the bootstrap pool runs everything. Traefik waits for
   container, the Key Vault and the ASO roles exist.
 - **`global-cd-repo-secret`** in the shared Key Vault: the CD repo's GitHub
   App, as GitOps Manager writes it (a Kubernetes Secret manifest as JSON).
-- **The runner's identity** (the runners' managed identity on
-  `gom-azure-long`, or `AZURE_CREATE_CLIENT_ID` elsewhere) needs:
-  - on each AKS subscription: Contributor (the resource group, the cluster,
-    its identities and the NIC) and the right to assign Contributor, Network
-    Contributor and Managed Identity Operator there (Owner, or Role Based
-    Access Control Administrator limited to those roles);
-  - on the node subnet's VNet: Network Contributor (joining the subnet), and
-    the right to assign Network Contributor on the subnet;
-  - on the container registry: the right to assign AcrPull;
-  - in the shared services subscription: what `id-aksmanager-identities` has
-    (setup step 12b: identities in the shared resource group and the ASO
-    roles), Key Vault Secrets Officer on the vault (the admin password, the
-    ASO client ID) and Storage Blob Data Contributor on the state container.
-  **Not wired yet:** setup does not grant these. core-stack's
-  `terraform/runners-azure` takes them as `role_assignments`.
+- **The runner's identity**: the runners' managed identity on
+  `gom-azure-long`, made and granted by setup with `RUNNERS=1`. Its roles are
+  in [`runner-roles.json`](../../runner-roles.json), with the scope of each
+  and why. Running the create elsewhere (`AZURE_CREATE_CLIENT_ID`), give that
+  identity the same `runners` grants.
 - **Repository variables:** listed at the top of the workflow.
 
 The cluster's API server is public, as the agent's create makes it; the

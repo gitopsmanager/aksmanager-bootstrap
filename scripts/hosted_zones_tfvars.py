@@ -20,9 +20,9 @@ import sys
 from pathlib import Path
 
 GUID = re.compile(r"^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$")
-# Key Vault secret names allow alphanumerics and dashes; underscores in a prefix
-# are turned into dashes when the secret is named, so they are allowed here.
-PREFIX = re.compile(r"^[A-Za-z0-9_-]+$")
+# Lower-case letters, digits and dashes only (11 Nov 2026), on every cloud: the
+# prefix names the secret <prefix>-dns-zone-certs as written, never rewritten.
+PREFIX = re.compile(r"^[a-z0-9-]+$")
 # Azure resource group names: alphanumerics, underscore, dash, period,
 # parentheses; up to 90 characters; not ending in a period.
 RESOURCE_GROUP = re.compile(r"^[\w\-.()]{1,90}(?<!\.)$")
@@ -67,12 +67,11 @@ def main() -> int:
         prefix = z.get("dns-zone-prefix", "")
         if prefix:
             if not PREFIX.fullmatch(prefix):
-                problems.append(f"{where}: dns-zone-prefix '{prefix}' may contain only letters, digits, '-' and '_'")
-            # Two prefixes that differ only by '_' vs '-' would name one secret.
-            secret = prefix.replace("_", "-") + "-dns-zone-certs"
-            if secret in seen_secret:
-                problems.append(f"{where}: dns-zone-prefix '{prefix}' and '{seen_secret[secret]}' both name the secret '{secret}'")
-            seen_secret[secret] = prefix
+                problems.append(f"{where}: dns-zone-prefix '{prefix}' may contain only lower-case letters, digits and '-'")
+            elif prefix in seen_secret:
+                problems.append(f"{where}: dns-zone-prefix '{prefix}' is used by {seen_secret[prefix]} as well")
+            else:
+                seen_secret[prefix] = where
 
         sub = str(z.get("subscription", ""))
         if sub and not GUID.fullmatch(sub):

@@ -216,6 +216,20 @@ if [ -n "${M2M_CLIENT_ID:-}" ] && [ -n "${M2M_COGNITO_URL:-}" ] && [ -n "${SERVE
            -var="m2m_token_url=${M2M_COGNITO_URL%/}/oauth2/token" -var="server_url=${SERVER_URL%/}")
 fi
 
+# Never older than the Terraform that last wrote this state: the repo's own
+# guard (scripts/terraform_version_guard.sh), once the private copy has it.
+if [ -f scripts/terraform_version_guard.sh ]; then
+    need=$(bash scripts/terraform_version_guard.sh azurerm "$STATE_ACCOUNT" "$STATE_CONTAINER" "$STATE_KEY") ||
+        die "could not read the runners state to check which Terraform wrote it"
+    if [ -n "$need" ]; then
+        log "The state was written by Terraform $need, newer than the pinned $TERRAFORM_VERSION: using $need"
+        TERRAFORM_INSTALL_DIR=/usr/local/bin bash scripts/install_terraform.sh "$need" >/dev/null ||
+            die "could not install Terraform $need"
+    fi
+else
+    log "No scripts/terraform_version_guard.sh in this copy yet: Terraform $TERRAFORM_VERSION as pinned"
+fi
+
 cd runners
 log "terraform init"
 terraform init -input=false -reconfigure \

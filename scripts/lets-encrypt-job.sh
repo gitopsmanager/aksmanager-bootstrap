@@ -15,8 +15,9 @@
 #
 # Steps:
 #   1. Tools: the image is mcr.microsoft.com/azure-cli (az, python3); git,
-#      unzip and openssl are added with tdnf, and Terraform is downloaded at
-#      its current release, checksum verified.
+#      unzip and openssl are added with tdnf. Terraform is downloaded after
+#      sign-in (2b): the pinned release, or the one that last wrote the state
+#      if that is newer, checksum verified.
 #   2. Sign in: az login --identity. Terraform and lego both use that az login
 #      (ARM_USE_CLI, azure_auth_method=cli). Terraform's azurerm backend cannot
 #      use a Container Apps managed identity directly -- it does not support
@@ -32,8 +33,9 @@
 #   6. terraform init + the empty-state guard + terraform apply.
 #
 # Configuration comes from the job's environment, set by setup-pipeline.ps1.
-# TERRAFORM_VERSION overrides the pinned Terraform release (1.17.1, the version
-# that wrote this state).
+# TERRAFORM_VERSION overrides the pinned Terraform release (1.17.1). Either way
+# the job never runs a Terraform older than the one that last wrote the state
+# (step 2b).
 # ALLOW_EMPTY_STATE=true overrides the empty-state guard (see below).
 # -----------------------------------------------------------------------------
 set -euo pipefail
@@ -59,21 +61,6 @@ if [ ${#need[@]} -gt 0 ]; then
     tdnf install -y -q "${need[@]}" >/dev/null || die "could not install ${need[*]}"
 fi
 
-# Pinned: a state written by a newer Terraform cannot be read by an older one,
-# so the version only moves deliberately, with the AWS builds.
-TF_VERSION="${TERRAFORM_VERSION:-1.17.1}"
-log "Terraform $TF_VERSION"
-(
-    cd "$WORK"
-    base="https://releases.hashicorp.com/terraform/${TF_VERSION}"
-    curl -fsSO "${base}/terraform_${TF_VERSION}_linux_amd64.zip"
-    curl -fsSO "${base}/terraform_${TF_VERSION}_SHA256SUMS"
-    grep " terraform_${TF_VERSION}_linux_amd64.zip\$" "terraform_${TF_VERSION}_SHA256SUMS" | sha256sum -c --quiet - ||
-        die "Terraform ${TF_VERSION} failed its checksum"
-    unzip -q -o "terraform_${TF_VERSION}_linux_amd64.zip" -d /usr/local/bin
-)
-terraform version
-
 # ── 2. Sign in as the job's managed identity ──────────────────────────────────
 log "Signing in as managed identity $AZURE_CLIENT_ID"
 # --client-id on current az; --username on releases before it.
@@ -84,6 +71,54 @@ az login --identity --client-id "$AZURE_CLIENT_ID" --allow-no-subscriptions -o n
 # az may not list the subscription at all; nothing below depends on it --
 # Terraform takes ARM_SUBSCRIPTION_ID and Key Vault calls name the vault.
 az account set --subscription "$SUBSCRIPTION_ID" 2>/dev/null || true
+
+# ── 2b. Terraform, never older than the state ─────────────────────────────────
+# Pinned, so the version only moves deliberately. But never backwards: an older
+# Terraform is not promised to read state a newer one wrote, and jobs released
+# before the pin installed whatever release was current, so a state can already
+# be newer than the pin. The state records the Terraform that last wrote it;
+# the job uses the higher of that and the pin. Read after sign-in, because the
+# state is read with this identity.
+TF_PINNED="${TERRAFORM_VERSION:-1.17.1}"
+state_version=""
+if az storage blob download --account-name "$STATE_ACCOUNT" --container-name "$STATE_CONTAINER" \
+        --name "$STATE_KEY" --auth-mode login --file "$WORK/state.json" -o none 2>"$WORK/state.err"; then
+    # The state holds every private key: read the one field, then remove it.
+    chmod 600 "$WORK/state.json"
+    state_version=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("terraform_version", ""))' \
+        "$WORK/state.json" 2>/dev/null || true)
+    rm -f "$WORK/state.json"
+elif grep -qi "BlobNotFound\|does not exist" "$WORK/state.err"; then
+    log "No Terraform state yet: using the pinned $TF_PINNED"
+else
+    die "could not read the Terraform state to check which version wrote it: $(cat "$WORK/state.err")"
+fi
+TF_VERSION=$(python3 - "$TF_PINNED" "$state_version" <<'PY'
+import re, sys
+def key(v):
+    m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", v.strip())
+    return tuple(map(int, m.groups())) if m else None
+pinned, state = sys.argv[1], sys.argv[2]
+if key(pinned) is None:
+    sys.exit(f"TERRAFORM_VERSION '{pinned}' is not a release version like 1.17.1")
+print(state if key(state) and key(state) > key(pinned) else pinned)
+PY
+) || die "could not choose a Terraform version"
+if [ "$TF_VERSION" != "$TF_PINNED" ]; then
+    log "Terraform $TF_VERSION: the state was written by $state_version, newer than the pinned $TF_PINNED, and Terraform never goes back"
+else
+    log "Terraform $TF_VERSION${state_version:+ (state last written by $state_version)}"
+fi
+(
+    cd "$WORK"
+    base="https://releases.hashicorp.com/terraform/${TF_VERSION}"
+    curl -fsSO "${base}/terraform_${TF_VERSION}_linux_amd64.zip"
+    curl -fsSO "${base}/terraform_${TF_VERSION}_SHA256SUMS"
+    grep " terraform_${TF_VERSION}_linux_amd64.zip\$" "terraform_${TF_VERSION}_SHA256SUMS" | sha256sum -c --quiet - ||
+        die "Terraform ${TF_VERSION} failed its checksum"
+    unzip -q -o "terraform_${TF_VERSION}_linux_amd64.zip" -d /usr/local/bin
+)
+terraform version
 
 # ── 3. The private repo, through the bootstrap GitHub App ─────────────────────
 log "Reading the GitHub App from $KEY_VAULT_NAME"
@@ -142,7 +177,7 @@ print(next((v for k, v in tags.items() if re.sub(r"[^a-z0-9]", "", k.lower()) ==
 blocked=()
 keep=()
 while IFS=$'\t' read -r key prefix zone; do
-    secret="${prefix//_/-}-dns-zone-certs"
+    secret="${prefix}-dns-zone-certs"
     if tags=$(az keyvault secret show --vault-name "$KEY_VAULT_NAME" --name "$secret" --query tags -o json 2>"$WORK/err"); then
         owner=$(printf '%s' "$tags" | managed_by)
         if [ "$owner" != "Terraform" ]; then
@@ -222,7 +257,7 @@ staging=$(python3 -c 'import json; print(str(json.load(open("hosted-zones.auto.t
 if [ "$staging" = "false" ]; then
     for key in "${keep[@]}"; do
         prefix=$(python3 -c 'import json,sys; print(json.load(open("hosted-zones.auto.tfvars.json"))["hosted_zones"][sys.argv[1]]["dns_zone_prefix"])' "$key")
-        secret="${prefix//_/-}-dns-zone-certs"
+        secret="${prefix}-dns-zone-certs"
         issuer=$(az keyvault secret show --vault-name "$KEY_VAULT_NAME" --name "$secret" --query value -o tsv 2>/dev/null |
                  python3 -c 'import json,sys; print(json.load(sys.stdin).get("tls.crt", ""))' 2>/dev/null |
                  openssl x509 -noout -issuer 2>/dev/null || true)

@@ -1,0 +1,109 @@
+{
+  "_comment": [
+    "Every Azure role GitOps Manager's runners get, read by setup-pipeline.ps1 step 12c (RUNNERS=1). This file is the list: setup grants what is here and nothing else.",
+    "Two identities: the runners (id-aksmanager-runners), which every workflow on gom-azure-adhoc / -long / -alerts runs as, and the runners job (id-aksmanager-runners-job), which only installs the runners and makes no role assignments.",
+    "Scopes: aks-subscriptions = this subscription and AKS_SUBSCRIPTIONS; identity-subscriptions = those, every subscription with a public zone, and shared services; container-registry and runners-environment are skipped when CONTAINER_REGISTRY_NAME / RUNNERS_ENVIRONMENT_ID are not set; secret:arc-app and secret:arc-app-key are skipped until the ARC GitHub App is installed from Settings.",
+    "Setup only adds. Removing a line here does not remove a grant already made: delete it in the portal or with az role assignment delete."
+  ],
+  "runners": {
+    "identity": "id-aksmanager-runners",
+    "grants": [
+      {
+        "role": "Contributor",
+        "scope": "aks-subscriptions",
+        "why": "Creates and changes clusters, their resource groups, managed identities, the Traefik NIC and node pools; joins the node subnet"
+      },
+      {
+        "role": "Azure Kubernetes Service RBAC Cluster Admin",
+        "scope": "aks-subscriptions",
+        "why": "kubectl on the clusters: the runners sign in through Entra (kubelogin), and on an Azure RBAC cluster Contributor gives no access inside it. A cluster using Kubernetes RBAC with Entra needs the identity in its admin group instead"
+      },
+      {
+        "role": "Managed Identity Contributor",
+        "scope": "shared-resource-group",
+        "why": "The cluster identities (ASO's and the platform identities) made by bootstrap-cluster-identities.yml"
+      },
+      {
+        "role": "Key Vault Secrets Officer",
+        "scope": "key-vault",
+        "why": "secret-write.yml, secret-read.yml and secret-delete.yml; the create's Argo CD admin password and ASO client ID"
+      },
+      {
+        "role": "Storage Blob Data Contributor",
+        "scope": "identities-state-container",
+        "why": "Terraform state of the create's stages and the cluster identities (tfstate-identities)"
+      },
+      {
+        "role": "AcrPull",
+        "scope": "container-registry",
+        "why": "Pulling the runner image"
+      }
+    ],
+    "may_assign": {
+      "role": "Role Based Access Control Administrator",
+      "scope": "identity-subscriptions",
+      "principal_type": "ServicePrincipal",
+      "why": "The create gives the cluster's own identities their roles, and identities and grants made through the CD repo get theirs. An ABAC condition limits it to these roles, to service principals only; it can never grant Owner, Contributor or any other role",
+      "roles": [
+        "Network Contributor",
+        "Managed Identity Operator",
+        "AcrPull",
+        "Key Vault Secrets User",
+        "DNS Zone Contributor",
+        "Private DNS Zone Contributor",
+        "AKSManagerNodePoolOperator",
+        "AKSManagerAppIdentityOperator"
+      ]
+    }
+  },
+  "runners_job": {
+    "identity": "id-aksmanager-runners-job",
+    "grants": [
+      {
+        "role": "Container Apps Contributor",
+        "scope": "runners-resource-group",
+        "why": "The runners' Container Apps and jobs (rg-aksmanager-runners only, so it cannot change its own job or the certificate job)"
+      },
+      {
+        "role": "Container Apps Contributor",
+        "scope": "runners-environment",
+        "why": "Placing the runners in the cluster monitor's Container Apps environment"
+      },
+      {
+        "role": "Managed Identity Operator",
+        "scope": "runners-identity",
+        "why": "Attaching id-aksmanager-runners to the runners"
+      },
+      {
+        "role": "Reader",
+        "scope": "key-vault",
+        "why": "Terraform looks the vault up"
+      },
+      {
+        "role": "Reader",
+        "scope": "container-registry",
+        "why": "Terraform looks the registry up"
+      },
+      {
+        "role": "Key Vault Secrets User",
+        "scope": "secret:bootstrap-app",
+        "why": "The bootstrap GitHub App, to clone this repo and read its variables"
+      },
+      {
+        "role": "Key Vault Secrets User",
+        "scope": "secret:arc-app",
+        "why": "The organisation's ARC GitHub App, which registers the runners"
+      },
+      {
+        "role": "AKSManagerVaultEntryWriter",
+        "scope": "secret:arc-app-key",
+        "why": "Writes (never reads) the copy of the App's key that the scaler (KEDA) reads"
+      },
+      {
+        "role": "Storage Blob Data Contributor",
+        "scope": "runners-state-container",
+        "why": "Its own Terraform state (tfstate-runners)"
+      }
+    ]
+  }
+}

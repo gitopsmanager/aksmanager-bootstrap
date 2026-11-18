@@ -2,23 +2,34 @@
 # Copyright (c) 2026 GitOps Manager, S.L.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Install one pinned Terraform release on a GitHub Actions runner.
+# Install one Terraform release, checksum verified.
 #
-#   scripts/install_terraform.sh <version>        e.g. 1.11.0
+#   scripts/install_terraform.sh <version> [<version>...]      e.g. 1.17.1
+#
+# With several versions (the pin, and what terraform_version_guard.sh found a
+# state was written by) the highest is installed: a run never goes backwards.
 #
 # GitOps Manager's runner image carries other tools but not Terraform, so the
 # workflows that run Terraform (bootstrap-create-cluster.yml,
 # bootstrap-cluster-identities.yml, bootstrap-handover.yml) install it here
-# first. The version is passed in, pinned in each workflow, and must match the
-# buildspecs' TERRAFORM_VERSION: a state written by a newer Terraform cannot be
-# read by an older one.
+# first, and the CodeBuild buildspecs use it too. The pin is passed in and must
+# match everywhere: raise it in every buildspec, generator and workflow
+# together, never lower it.
 #
 # Downloads from releases.hashicorp.com and checks the zip against the
-# release's SHA256SUMS before installing. Installs into $RUNNER_TEMP (no root
-# needed) and adds it to $GITHUB_PATH for the steps that follow.
+# release's SHA256SUMS before installing. Installs into TERRAFORM_INSTALL_DIR
+# when set (CodeBuild: /usr/local/bin), else ${RUNNER_TEMP:-/tmp}/terraform-<version>
+# (no root needed), and adds that to $GITHUB_PATH for the steps that follow.
 set -euo pipefail
 
-version="${1:?usage: install_terraform.sh <version>}"
+[ $# -gt 0 ] || { echo "usage: install_terraform.sh <version> [<version>...]" >&2; exit 2; }
+for v in "$@"; do
+  [ -z "$v" ] || [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+    { echo "install_terraform.sh: '$v' is not a release version like 1.17.1" >&2; exit 2; }
+done
+version=$(printf '%s\n' "$@" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+[ -n "$version" ] || { echo "install_terraform.sh: no version given" >&2; exit 2; }
+[ "$version" = "$1" ] || echo "Terraform ${version}, not the pinned $1: a state was written by ${version}, and Terraform never goes back"
 
 case "$(uname -m)" in
   x86_64|amd64)  arch=amd64 ;;
@@ -29,7 +40,7 @@ esac
 zip="terraform_${version}_linux_${arch}.zip"
 base="https://releases.hashicorp.com/terraform/${version}"
 work="$(mktemp -d)"
-bin="${RUNNER_TEMP:-/tmp}/terraform-${version}"
+bin="${TERRAFORM_INSTALL_DIR:-${RUNNER_TEMP:-/tmp}/terraform-${version}}"
 
 curl -fsSL -o "${work}/${zip}" "${base}/${zip}"
 curl -fsSL -o "${work}/SHA256SUMS" "${base}/terraform_${version}_SHA256SUMS"

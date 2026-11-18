@@ -26,12 +26,11 @@
 # -----------------------------------------------------------------------------
 
 locals {
-  # Key Vault secret names: 1-127 characters, alphanumerics and dashes only.
-  # dev -> dev-dns-zone-certs, we_prod -> we-prod-dns-zone-certs. The agent must
-  # build the name with the same rule.
+  # <prefix>-dns-zone-certs, as written: prefixes are lower-case letters,
+  # digits and dashes only (hosted_zones_tfvars.py refuses anything else).
   secret_names = {
     for k, z in var.hosted_zones :
-    k => "${replace(z.dns_zone_prefix, "_", "-")}-dns-zone-certs"
+    k => "${z.dns_zone_prefix}-dns-zone-certs"
   }
 }
 

@@ -154,6 +154,13 @@ on_cancel() {
 }
 trap on_cancel INT TERM
 
+# Never older than the Terraform that last wrote this state.
+need=$(bash "$here/terraform_version_guard.sh" azurerm "$STATE_ACCOUNT" "$STATE_CONTAINER" "$key")
+if [ -n "$need" ]; then
+  bash "$here/install_terraform.sh" "$need" >/dev/null
+  PATH="${TERRAFORM_INSTALL_DIR:-${RUNNER_TEMP:-/tmp}/terraform-${need}}:$PATH"
+fi
+
 echo "::group::terraform init ($key)"
 terraform -chdir="$dir" init -input=false -reconfigure \
   -backend-config="storage_account_name=$STATE_ACCOUNT" \

@@ -510,11 +510,11 @@ function Read-HostedZones([string] $Path) {
         }
         $prefix = [string]$z.'dns-zone-prefix'
         if ($prefix) {
-            if ($prefix -cnotmatch '^[A-Za-z0-9_-]+$') { $problems += "${where}: dns-zone-prefix '$prefix' may contain only letters, digits, '-' and '_'" }
-            # Two prefixes that differ only by '_' vs '-' would name one secret.
-            $secret = ($prefix -replace '_', '-') + "-dns-zone-certs"
-            if ($seenSecret.ContainsKey($secret)) { $problems += "${where}: dns-zone-prefix '$prefix' and '$($seenSecret[$secret])' both name the secret '$secret'" }
-            $seenSecret[$secret] = $prefix
+            # Lower-case letters, digits and dashes only (11 Nov 2026): the prefix
+            # names the secret <prefix>-dns-zone-certs as written.
+            if ($prefix -cnotmatch '^[a-z0-9-]+$') { $problems += "${where}: dns-zone-prefix '$prefix' may contain only lower-case letters, digits and '-'" }
+            elseif ($seenSecret.ContainsKey($prefix)) { $problems += "${where}: dns-zone-prefix '$prefix' is used by $($seenSecret[$prefix]) as well" }
+            else { $seenSecret[$prefix] = $where }
         }
         $sub = [string]$z.subscription
         if ($sub -and $sub -notmatch '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') { $problems += "${where}: subscription '$sub' is not a subscription ID (GUID)" }
@@ -802,7 +802,7 @@ $blocked = @()
 $kept = [ordered]@{}
 foreach ($p in $zonesDoc.hosted_zones.PSObject.Properties) {
     $z = $p.Value
-    $secret = ($z.dns_zone_prefix -replace '_', '-') + "-dns-zone-certs"
+    $secret = "$($z.dns_zone_prefix)-dns-zone-certs"
     $live = Invoke-AzRetryAuth keyvault secret show --vault-name $KeyVaultName --name $secret --query "{tags:tags}"
     if ($live.Ok) {
         $owner = Get-ManagedBy $live.Data.tags
@@ -1381,39 +1381,13 @@ if ($runnersEnabled) {
 # Modelled on AWS, where that pipeline creates nothing that grants: the
 # runners run as an identity this script makes and grants once, here, as the
 # AWS runners run as the agent role; the job only builds the runners' apps and
-# attaches that identity. Two identities:
-#
-#   $RunnersIdentity (the runners) -- what terraform/create-cluster/README.md lists
-#     for the runner's identity, and what the ad-hoc commands need:
-#       - Contributor on each AKS subscription (the resource group, the
-#         cluster, its identities, the NIC, joining the node subnet)
-#       - Role Based Access Control Administrator there, in each subscription
-#         with a public zone, and in shared services, under an ABAC condition:
-#         assign Contributor, Network Contributor, Managed Identity Operator,
-#         AcrPull and the cluster identities' roles (step 12b), to service
-#         principals, and nothing else
-#       - Managed Identity Contributor on $SharedRg (the cluster identities)
-#       - Key Vault Secrets Officer on the vault (secret-write.yml and
-#         secret-delete.yml run as it; the create's admin password)
-#       - AcrPull on the registry (the runner image)
-#       - Storage Blob Data Contributor on $IdentitiesContainer (the create's
-#         stages)
-#   $RunnersJobIdentity (the job) -- no role assignments of any kind:
-#       - Container Apps Contributor on $RunnersRg, where the runners' apps
-#         and jobs go (not $SharedRg: the job cannot change its own job or the
-#         certificate job)
-#       - Container Apps Contributor on the cluster monitor's environment
-#         (RUNNERS_ENVIRONMENT_ID), to place the runners in it
-#       - Managed Identity Operator on $RunnersIdentity, to attach it
-#       - Reader on the vault and the registry (Terraform looks them up)
-#       - Key Vault Secrets User on two secrets: the bootstrap App's (to clone
-#         this repo and read its variables) and the organisation's GitHub App
-#         secret (global-arc-global-arc-runner-<org>)
-#       - $VaultWriterRole (write, never read) on one secret, <that>-key, the
-#         copy of the App's key the scaler (KEDA) reads; created here empty so
-#         it can be granted on
-#       - Storage Blob Data Contributor on its own state container,
-#         $RunnersContainer
+# attaches that identity. Two identities, and what each gets is in
+# runner-roles.json (read below; nothing else is granted):
+#   $RunnersIdentity (the runners) -- every workflow on the gom-azure-* runners
+#     runs as it: the create, secrets, cluster actions. It may also assign a
+#     fixed list of roles, under an ABAC condition.
+#   $RunnersJobIdentity (the job) -- installs the runners; no role assignments
+#     of any kind.
 # The organisation's App secret exists once the GitHub App is installed from
 # Settings; until then the job is made but cannot read it, and says so: re-run
 # this script after installing the App.
@@ -1456,24 +1430,99 @@ foreach ($name in @($RunnersIdentity, $RunnersJobIdentity)) {
 $RunnersPrincipalId = $identities[$RunnersIdentity].principalId
 $RunnersJobPrincipalId = $identities[$RunnersJobIdentity].principalId
 
-# The runners' identity.
-foreach ($sub in $AksSubs) {
-    Grant-Role $RunnersPrincipalId "ServicePrincipal" "Contributor" "/subscriptions/$sub" "$RunnersIdentity on /subscriptions/$sub"
-}
-Grant-Role $RunnersPrincipalId "ServicePrincipal" "Managed Identity Contributor" "/subscriptions/$SubscriptionId/resourceGroups/$SharedRg" "$RunnersIdentity on $SharedRg"
-Grant-Role $RunnersPrincipalId "ServicePrincipal" "Key Vault Secrets Officer" $KeyVaultId "$RunnersIdentity on $KeyVaultName"
-Grant-Role $RunnersPrincipalId "ServicePrincipal" "Storage Blob Data Contributor" `
-    "$StateAccountId/blobServices/default/containers/$IdentitiesContainer" "$RunnersIdentity on $IdentitiesContainer"
+# What both identities get is runner-roles.json: setup grants what is listed
+# there and nothing else, so the file is the one place to see it.
+$runnerRolesPath = Join-Path $RepoRoot "runner-roles.json"
+if (-not (Test-Path $runnerRolesPath)) { Write-Error "runner-roles.json not found in $RepoRoot -- Sync the repo from Settings."; exit 1 }
+try { $RunnerRoles = Get-Content $runnerRolesPath -Raw | ConvertFrom-Json } catch { Write-Error "runner-roles.json is not valid JSON: $_"; exit 1 }
+# Never granted straight from the file: RBAC Administrator only through
+# may_assign, under its condition.
+$neverGranted = @("Owner", "User Access Administrator", "Role Based Access Control Administrator")
+
 $AcrId = ""
 if ($AcrName) {
     $AcrId = (Assert-Az "Reading $AcrName" (Invoke-Az acr show --name $AcrName --resource-group $AcrRg)).id
-    Grant-Role $RunnersPrincipalId "ServicePrincipal" "AcrPull" $AcrId "$RunnersIdentity on $AcrName"
+}
+if (-not $RunnersEnvironmentId) {
+    Write-Warning "RUNNERS_ENVIRONMENT_ID is not set (the cluster monitor's Container Apps environment, terraform/cluster-monitor-azure's output container_app_environment_id). The runners job will not apply until it is: set it and run this script again."
 }
 
-$runnerAssignable = @($assignable)
-foreach ($r in @("Contributor", "Network Contributor", "Managed Identity Operator", "AcrPull")) {
+$exists = Invoke-AzRetryAuth storage container exists --name $RunnersContainer --account-name $StateAccount --auth-mode login
+if (-not ($exists.Ok -and $exists.Data.exists)) {
+    Assert-Az "Creating container $RunnersContainer" (Invoke-AzRetryAuth storage container create --name $RunnersContainer `
+        --account-name $StateAccount --auth-mode login) | Out-Null
+    Write-Host "  + container $RunnersContainer created"
+} else {
+    Write-Host "  = container $RunnersContainer exists"
+}
+
+# The organisation's App secret and the key's copy, granted on each secret
+# (secret:arc-app, secret:arc-app-key) once the App is installed.
+$arcPresent = $false
+$arc = Invoke-VaultSecretRetryAuth -Vault $KeyVaultName -Name $ArcSecretName
+if ($arc.Ok) {
+    $arcPresent = $true
+    $key = Invoke-VaultSecretRetryAuth -Vault $KeyVaultName -Name $ArcKeySecretName
+    if (-not $key.Ok) {
+        if ($key.Err -notmatch 'SecretNotFound') { Write-Error "Could not read $ArcKeySecretName`n$($key.Err)"; exit 1 }
+        Assert-Az "Creating $ArcKeySecretName (empty until the runners job writes it)" `
+            (Set-VaultSecret -Vault $KeyVaultName -Name $ArcKeySecretName -Value "pending: written by $RunnersJobName" -ContentType "text/plain") | Out-Null
+        Write-Host "  + $ArcKeySecretName created, empty until the runners job writes it"
+    }
+} elseif ($arc.Err -match 'SecretNotFound') {
+    Write-Warning "$ArcSecretName is not in $KeyVaultName yet: install the ARC GitHub App from Settings, then run this script again so the runners job may read it."
+} else {
+    Write-Error "Could not read $ArcSecretName`n$($arc.Err)"; exit 1
+}
+
+# runner-roles.json's scope names. Nothing returned = not set up yet: skipped.
+function Resolve-RunnerScope([string] $Token) {
+    switch ($Token) {
+        "aks-subscriptions"          { return @($AksSubs | ForEach-Object { "/subscriptions/$_" }) }
+        "identity-subscriptions"     { return @($idSubs | ForEach-Object { "/subscriptions/$_" }) }
+        "shared-resource-group"      { return "/subscriptions/$SubscriptionId/resourceGroups/$SharedRg" }
+        "key-vault"                  { return $KeyVaultId }
+        "identities-state-container" { return "$StateAccountId/blobServices/default/containers/$IdentitiesContainer" }
+        "container-registry"         { if ($AcrId) { return $AcrId }; return }
+        "runners-resource-group"     { return $RunnersRgId }
+        "runners-identity"           { return [string]$identities[$RunnersIdentity].id }
+        "runners-environment"        { if ($RunnersEnvironmentId) { return $RunnersEnvironmentId }; return }
+        "runners-state-container"    { return "$StateAccountId/blobServices/default/containers/$RunnersContainer" }
+        "secret:bootstrap-app"       { return "$KeyVaultId/secrets/$AppSecretName" }
+        "secret:arc-app"             { if ($arcPresent) { return "$KeyVaultId/secrets/$ArcSecretName" }; return }
+        "secret:arc-app-key"         { if ($arcPresent) { return "$KeyVaultId/secrets/$ArcKeySecretName" }; return }
+        default { Write-Error "runner-roles.json: unknown scope '$Token'."; exit 1 }
+    }
+}
+
+foreach ($set in @(
+        @{ Def = $RunnerRoles.runners;     Principal = $RunnersPrincipalId;    Name = $RunnersIdentity },
+        @{ Def = $RunnerRoles.runners_job; Principal = $RunnersJobPrincipalId; Name = $RunnersJobIdentity })) {
+    if ($set.Def.identity -ne $set.Name) {
+        Write-Error "runner-roles.json names '$($set.Def.identity)' where '$($set.Name)' was expected."; exit 1
+    }
+    foreach ($g in @($set.Def.grants)) {
+        if ($neverGranted -contains $g.role) { Write-Error "runner-roles.json: '$($g.role)' is never granted to the runners."; exit 1 }
+        $scopes = @(Resolve-RunnerScope $g.scope)
+        if ($scopes.Count -eq 0) { Write-Host "  - $($set.Name): '$($g.role)' on $($g.scope) skipped (not set up yet)"; continue }
+        foreach ($sc in $scopes) { Grant-Role $set.Principal "ServicePrincipal" $g.role $sc "$($set.Name) on $sc" }
+    }
+}
+
+# Role Based Access Control Administrator, limited by an ABAC condition to
+# may_assign's roles, assigned to service principals. Never Owner, User Access
+# Administrator, RBAC Administrator or Contributor (dropped from the control
+# plane 12 Nov 2026). A setup run replaces an older assignment whose condition
+# differs.
+$ma = $RunnerRoles.runners.may_assign
+if ($ma.role -ne $RbacAdminRole -or $ma.principal_type -ne "ServicePrincipal") {
+    Write-Error "runner-roles.json: may_assign must be '$RbacAdminRole' for 'ServicePrincipal'."; exit 1
+}
+$runnerAssignable = @()
+foreach ($r in @($ma.roles)) {
+    if (($neverGranted + @("Contributor")) -contains $r) { Write-Error "runner-roles.json: the runners may never assign '$r'."; exit 1 }
     $d = Get-RoleDefinition $r "/subscriptions/$SubscriptionId"
-    if (-not $d) { Write-Error "Could not find the built-in role '$r'."; exit 1 }
+    if (-not $d) { Write-Error "runner-roles.json: could not find the role '$r'."; exit 1 }
     $runnerAssignable += [string]$d.name
 }
 $runnerGuids = ($runnerAssignable | Sort-Object -Unique) -join ', '
@@ -1482,8 +1531,8 @@ $runnerCondition = "((!(ActionMatches{'Microsoft.Authorization/roleAssignments/w
     "@Request[Microsoft.Authorization/roleAssignments:PrincipalType] StringEqualsIgnoreCase 'ServicePrincipal')) AND " +
     "((!(ActionMatches{'Microsoft.Authorization/roleAssignments/delete'})) OR " +
     "(@Resource[Microsoft.Authorization/roleAssignments:RoleDefinitionId] ForAnyOfAnyValues:GuidEquals {$runnerGuids}))"
-foreach ($sub in $idSubs) {
-    $scope = "/subscriptions/$sub"
+$maDescription = "GitOps Manager: the runners may assign $(@($ma.roles) -join ', ') to service principals, and nothing else (runner-roles.json)"
+foreach ($scope in @(Resolve-RunnerScope $ma.scope)) {
     $existing = Invoke-Az role assignment list --assignee-object-id $RunnersPrincipalId --role $RbacAdminRole --scope $scope
     $atScope = @(@($existing.Data) | Where-Object { $_ -and $_.scope -eq $scope })
     if (@($atScope | Where-Object { (& $normalise $_.condition) -eq (& $normalise $runnerCondition) }).Count -gt 0) {
@@ -1497,49 +1546,8 @@ foreach ($sub in $idSubs) {
     Assert-Az "Letting $RunnersIdentity assign the runners' roles in $scope" `
         (Invoke-Az role assignment create --assignee-object-id $RunnersPrincipalId --assignee-principal-type ServicePrincipal `
             --role $RbacAdminRole --scope $scope --condition $runnerCondition --condition-version "2.0" `
-            --description "GitOps Manager: the runners may assign Contributor, Network Contributor, Managed Identity Operator, AcrPull and the cluster identities' roles to service principals, and nothing else") | Out-Null
+            --description $maDescription) | Out-Null
     Write-Host "  + $RunnersIdentity may assign the runners' roles in $scope (nothing else)"
-}
-
-# The job's identity: no role assignments, no secret values but two.
-Grant-Role $RunnersJobPrincipalId "ServicePrincipal" "Container Apps Contributor" $RunnersRgId "$RunnersJobIdentity on $RunnersRg"
-Grant-Role $RunnersJobPrincipalId "ServicePrincipal" "Managed Identity Operator" $identities[$RunnersIdentity].id "$RunnersJobIdentity on $RunnersIdentity"
-Grant-Role $RunnersJobPrincipalId "ServicePrincipal" "Reader" $KeyVaultId "$RunnersJobIdentity on $KeyVaultName"
-if ($AcrId) { Grant-Role $RunnersJobPrincipalId "ServicePrincipal" "Reader" $AcrId "$RunnersJobIdentity on $AcrName" }
-Grant-Role $RunnersJobPrincipalId "ServicePrincipal" "Key Vault Secrets User" "$KeyVaultId/secrets/$AppSecretName" "$RunnersJobIdentity on $AppSecretName"
-if ($RunnersEnvironmentId) {
-    Grant-Role $RunnersJobPrincipalId "ServicePrincipal" "Container Apps Contributor" $RunnersEnvironmentId "$RunnersJobIdentity on the runners' environment"
-} else {
-    Write-Warning "RUNNERS_ENVIRONMENT_ID is not set (the cluster monitor's Container Apps environment, terraform/cluster-monitor-azure's output container_app_environment_id). The runners job will not apply until it is: set it and run this script again."
-}
-
-$exists = Invoke-AzRetryAuth storage container exists --name $RunnersContainer --account-name $StateAccount --auth-mode login
-if (-not ($exists.Ok -and $exists.Data.exists)) {
-    Assert-Az "Creating container $RunnersContainer" (Invoke-AzRetryAuth storage container create --name $RunnersContainer `
-        --account-name $StateAccount --auth-mode login) | Out-Null
-    Write-Host "  + container $RunnersContainer created"
-} else {
-    Write-Host "  = container $RunnersContainer exists"
-}
-Grant-Role $RunnersJobPrincipalId "ServicePrincipal" "Storage Blob Data Contributor" `
-    "$StateAccountId/blobServices/default/containers/$RunnersContainer" "$RunnersJobIdentity on $RunnersContainer"
-
-# The organisation's App secret and the key's copy, granted on each secret.
-$arc = Invoke-VaultSecretRetryAuth -Vault $KeyVaultName -Name $ArcSecretName
-if ($arc.Ok) {
-    Grant-Role $RunnersJobPrincipalId "ServicePrincipal" "Key Vault Secrets User" "$KeyVaultId/secrets/$ArcSecretName" "$RunnersJobIdentity on $ArcSecretName"
-    $key = Invoke-VaultSecretRetryAuth -Vault $KeyVaultName -Name $ArcKeySecretName
-    if (-not $key.Ok) {
-        if ($key.Err -notmatch 'SecretNotFound') { Write-Error "Could not read $ArcKeySecretName`n$($key.Err)"; exit 1 }
-        Assert-Az "Creating $ArcKeySecretName (empty until the runners job writes it)" `
-            (Set-VaultSecret -Vault $KeyVaultName -Name $ArcKeySecretName -Value "pending: written by $RunnersJobName" -ContentType "text/plain") | Out-Null
-        Write-Host "  + $ArcKeySecretName created, empty until the runners job writes it"
-    }
-    Grant-Role $RunnersJobPrincipalId "ServicePrincipal" $VaultWriterRole "$KeyVaultId/secrets/$ArcKeySecretName" "$RunnersJobIdentity on $ArcKeySecretName"
-} elseif ($arc.Err -match 'SecretNotFound') {
-    Write-Warning "$ArcSecretName is not in $KeyVaultName yet: install the ARC GitHub App from Settings, then run this script again so the runners job may read it."
-} else {
-    Write-Error "Could not read $ArcSecretName`n$($arc.Err)"; exit 1
 }
 
 # The job, beside the certificate job in $SharedRg (out of the job identity's

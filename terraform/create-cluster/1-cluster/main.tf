@@ -55,8 +55,7 @@ locals {
   exact_version      = can(regex("^[0-9]+\\.[0-9]+\\.[0-9]+$", var.cluster.kubernetes_version))
   kubernetes_version = local.exact_version ? var.cluster.kubernetes_version : data.azurerm_kubernetes_service_versions.this[0].latest_version
 
-  cluster_rg_scope = "/subscriptions/${var.cluster.subscription_id}/resourceGroups/${var.cluster.resource_group}"
-  acr_scope        = "/subscriptions/${var.runtime.shared_subscription_id}/resourceGroups/${var.cluster.container_registry.resource_group}/providers/Microsoft.ContainerRegistry/registries/${var.cluster.container_registry.name}"
+  acr_scope = "/subscriptions/${var.runtime.shared_subscription_id}/resourceGroups/${var.cluster.container_registry.resource_group}/providers/Microsoft.ContainerRegistry/registries/${var.cluster.container_registry.name}"
 
   # The agent's flags, in azurerm's spelling.
   tier = { free = "Free", standard = "Standard", premium = "Premium" }[lower(var.cluster.tier)]
@@ -151,13 +150,13 @@ resource "azurerm_role_assignment" "kubelet_acr_pull" {
   description          = "GitOps Manager: ${local.name} kubelet pulls images"
 }
 
-resource "azurerm_role_assignment" "cp_cluster_rg" {
-  scope                = local.cluster_rg_scope
-  role_definition_name = "Contributor"
-  principal_id         = azurerm_user_assigned_identity.control_plane.principal_id
-  principal_type       = "ServicePrincipal"
-  description          = "GitOps Manager: ${local.name} control plane on its resource group"
-}
+# No Contributor for the control plane on the cluster's resource group (12 Nov
+# 2026; the agent's assign_aks_managed_ids dropped it too). AKS needs rights
+# outside its node resource group only for things these clusters don't use:
+# load balancer IPs or route tables in another group, private-cluster DNS
+# zones, disks in another group. The subnet grant below and the node resource
+# group grant after the cluster cover the rest, and Contributor stays off the
+# roles anything here may assign.
 
 resource "azurerm_role_assignment" "cp_subnet" {
   scope                = var.cluster.network.subnet_id
@@ -268,7 +267,6 @@ resource "azurerm_kubernetes_cluster" "this" {
 
   depends_on = [
     azurerm_role_assignment.cp_kubelet_operator,
-    azurerm_role_assignment.cp_cluster_rg,
     azurerm_role_assignment.cp_subnet,
   ]
 }

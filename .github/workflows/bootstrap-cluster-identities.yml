@@ -289,6 +289,13 @@ jobs:
               "subnet_vnet_ids": json.loads(os.environ["VNETS"]),
           }, open("identity.auto.tfvars.json", "w"), indent=2)
           PY
+          # Never older than the Terraform that last wrote this state.
+          need=$(bash "$GITHUB_WORKSPACE/scripts/terraform_version_guard.sh" azurerm \
+                   "$STATE_ACCOUNT" "$STATE_CONTAINER" "identities/${CLUSTER}/${IDENTITY}.tfstate")
+          if [ -n "$need" ]; then
+            bash "$GITHUB_WORKSPACE/scripts/install_terraform.sh" "$need" >/dev/null
+            PATH="${RUNNER_TEMP}/terraform-${need}:$PATH"
+          fi
           terraform init -input=false \
             "-backend-config=storage_account_name=${STATE_ACCOUNT}" \
             "-backend-config=container_name=${STATE_CONTAINER}" \
